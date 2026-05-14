@@ -5,3 +5,4 @@ pyzbar
 Pillow
 pandas
 beautifulsoup4
+opencv-python-headless
