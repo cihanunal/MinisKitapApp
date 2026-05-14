@@ -23,6 +23,11 @@ except Exception:
     cv2 = None
     np = None
 
+try:
+    import isbnlib
+except Exception:
+    isbnlib = None
+
 
 APP_DIR = Path(__file__).resolve().parent
 APP_NAME = "Badgers' Kitap App"
@@ -43,6 +48,7 @@ HTTP_HEADERS = {
 }
 
 REQUEST_TIMEOUT = 8
+LOOKUP_CACHE_VERSION = 4
 
 PAGE_LABELS = {
     "library": "🏠 Kütüphanem",
@@ -255,8 +261,21 @@ def is_noise_text(value: str) -> bool:
     if not value:
         return True
     key = canonical_key(value)
+    if not key:
+        return True
     exact_noise = {
         "listesi",
+        "populer",
+        "popular",
+        "cok satanlar",
+        "cok satan",
+        "en cok satanlar",
+        "sinav kitaplari",
+        "ders kitaplari",
+        "okula yardimci",
+        "kampanyalar",
+        "tum kampanyalar",
+        "urun",
         "yazar listesi",
         "yayinevi listesi",
         "kategori listesi",
@@ -277,6 +296,8 @@ def is_noise_text(value: str) -> bool:
         "sonuc bulunamadi",
         "input",
         "button",
+        "fork",
+        "share",
     }
     if key in exact_noise:
         return True
@@ -302,6 +323,10 @@ def is_bad_title(title: str, variants: list[str] | None = None, source: str = ""
     if is_noise_text(title):
         return True
     key = canonical_key(title)
+    if len(key) < 2:
+        return True
+    if not re.search(r"[A-Za-zÇĞİÖŞÜçğıöşü]", title):
+        return True
     source_key = canonical_key(source)
     bad_phrases = (
         "arama",
@@ -387,6 +412,27 @@ def normalize_book_payload(data: dict) -> dict:
     normalized["loaned_to"] = clean_text(normalized.get("loaned_to"))
     normalized["rating"] = normalized.get("rating") or None
     return {key: normalized.get(key) for key in SAVE_FIELDS if key in normalized}
+
+
+def is_meaningful_book_record(record: dict, variants: list[str] | None = None) -> bool:
+    variants = variants or [record.get("isbn", "")]
+    if not record or is_bad_title(record.get("title"), variants, record.get("_source", "")):
+        return False
+    title_key = canonical_key(record.get("title"))
+    if len(title_key.split()) == 1 and len(title_key) <= 2:
+        return False
+
+    author = clean_field_value(record.get("author"))
+    publisher = clean_field_value(record.get("publisher"))
+    page_count = clean_field_value(record.get("page_count"))
+    source = clean_text(record.get("_source"))
+
+    trusted_sources = ("Google Books", "Open Library", "ISBNdb", "isbnlib")
+    if any(source.startswith(trusted) for trusted in trusted_sources):
+        return True
+
+    # Web kazıma kayıtları daha riskli olduğu için başlık dışında en az bir anlamlı alan isteriz.
+    return bool(author or publisher or page_count)
 
 
 def show_schema_error(exc: Exception):
@@ -773,6 +819,60 @@ def search_isbndb(variants: list[str]) -> list[dict]:
     return records
 
 
+def search_isbnlib(variants: list[str]) -> list[dict]:
+    """isbnlib ISBN doğrulama/metadata için ek kaynaktır; barkod görseli okumaz."""
+    if isbnlib is None:
+        return []
+
+    records = []
+    services = ("goob", "openl", "wiki")
+    for isbn in variants:
+        try:
+            canonical = isbnlib.canonical(isbn)
+        except Exception:
+            canonical = isbn
+        if not canonical:
+            continue
+
+        for service in services:
+            try:
+                data = isbnlib.meta(canonical, service=service)
+            except Exception:
+                data = {}
+            if not data:
+                continue
+
+            isbn13 = clean_text(data.get("ISBN-13") or data.get("ISBN13") or canonical)
+            if isbn13 and isbn13 not in variants and only_digits(isbn13) not in variants:
+                continue
+
+            title = clean_text(data.get("Title") or data.get("title"))
+            if is_bad_title(title, variants, "isbnlib"):
+                continue
+
+            authors = data.get("Authors") or data.get("authors") or ""
+            if isinstance(authors, list):
+                authors = ", ".join(clean_text(author) for author in authors)
+
+            book = blank_book(variants[0])
+            book.update(
+                {
+                    "title": title,
+                    "author": dedupe_comma_values(authors),
+                    "publisher": normalize_publisher_name(data.get("Publisher") or data.get("publisher")),
+                    "published_date": clean_text(data.get("Year") or data.get("year")),
+                    "first_print_year": first_year(data.get("Year") or data.get("year")),
+                    "language": pretty_language(data.get("Language") or data.get("language")),
+                    "source_url": "",
+                    "_source": f"isbnlib/{service}",
+                    "_isbn_matched": True,
+                }
+            )
+            if is_meaningful_book_record(book, variants):
+                records.append(book)
+    return records
+
+
 # --- SON SANS: TURKCE SITE HTML / JSON-LD OKUMA ---
 def image_to_url(value) -> str:
     if isinstance(value, list) and value:
@@ -1097,6 +1197,8 @@ def sanitize_scraped_record(record: dict, variants: list[str], source: str) -> d
     record["author"] = dedupe_comma_values(record.get("author"))
     record["translator"] = dedupe_comma_values(record.get("translator"))
     record["publisher"] = normalize_publisher_name(record.get("publisher"))
+    if not is_meaningful_book_record(record, variants):
+        return None
     return record
 
 
@@ -1363,8 +1465,7 @@ def merge_records(normalized: dict, records: list[dict]) -> dict | None:
     usable = [
         record
         for record in records
-        if clean_text(record.get("title"))
-        and not is_bad_title(record.get("title"), normalized.get("variants", []), record.get("_source", ""))
+        if is_meaningful_book_record(record, normalized.get("variants", []))
         and score_record(record) > 0
     ]
     if not usable:
@@ -1389,7 +1490,8 @@ def merge_records(normalized: dict, records: list[dict]) -> dict | None:
 
 
 @st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
-def get_book_info_comprehensive(raw_isbn: str) -> dict:
+def get_book_info_comprehensive(raw_isbn: str, cache_version: int = LOOKUP_CACHE_VERSION) -> dict:
+    _ = cache_version
     normalized = normalize_isbn(raw_isbn)
     if not normalized:
         return {
@@ -1404,6 +1506,7 @@ def get_book_info_comprehensive(raw_isbn: str) -> dict:
     records = []
     records.extend(search_google_books(variants))
     records.extend(search_openlibrary(variants))
+    records.extend(search_isbnlib(variants))
     records.extend(search_isbndb(variants))
     records.extend(search_direct_isbn_pages(variants))
 
@@ -1757,6 +1860,9 @@ def render_sidebar(all_books: list[dict]):
         mime="text/csv",
         use_container_width=True,
     )
+    if st.sidebar.button("Kitap arama önbelleğini temizle", use_container_width=True):
+        st.cache_data.clear()
+        st.sidebar.success("Arama önbelleği temizlendi.")
 
     return personal_filter, status_filter, tag_filter, search_term, sort_by
 
