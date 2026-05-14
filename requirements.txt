@@ -1,0 +1,6 @@
+streamlit
+supabase
+requests
+pyzbar
+Pillow
+pandas
