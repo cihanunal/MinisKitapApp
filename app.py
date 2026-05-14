@@ -12,9 +12,16 @@ from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from pyzbar.pyzbar import decode
 from supabase import Client, create_client
+
+try:
+    import cv2
+    import numpy as np
+except Exception:
+    cv2 = None
+    np = None
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -1762,18 +1769,133 @@ def render_cover(cover_url: str, width: int = 120):
         st.caption("Kapak yok")
 
 
+def isbn_from_barcode_payload(payload: str) -> str:
+    payload = clean_text(payload)
+    normalized = normalize_isbn(payload)
+    if normalized:
+        return normalized["isbn13"] or normalized["variants"][0]
+
+    digits = only_digits(payload)
+    # Bazı görüntülerde EAN-13'ün soldaki ilk hanesi ayrı okunabilir. 12 hane geldiyse
+    # başına 9 ekleyip geçerli ISBN-13 oluyor mu diye güvenli şekilde deneriz.
+    if len(digits) == 12:
+        maybe_isbn = "9" + digits
+        normalized = normalize_isbn(maybe_isbn)
+        if normalized and normalized["valid"]:
+            return normalized["isbn13"]
+    return ""
+
+
+def barcode_payloads_from_pil(image: Image.Image) -> list[str]:
+    payloads = []
+    try:
+        for item in decode(image):
+            value = item.data.decode("utf-8", errors="ignore").strip()
+            if value:
+                payloads.append(value)
+    except Exception:
+        pass
+    return payloads
+
+
+def pil_barcode_variants(image: Image.Image) -> list[Image.Image]:
+    image = ImageOps.exif_transpose(image).convert("RGB")
+    width, height = image.size
+    crops = [
+        image,
+        image.crop((0, int(height * 0.25), width, height)),
+        image.crop((0, int(height * 0.35), width, height)),
+        image.crop((0, int(height * 0.45), width, height)),
+        image.crop((int(width * 0.05), int(height * 0.25), int(width * 0.95), height)),
+    ]
+
+    variants = []
+    for crop in crops:
+        gray = ImageOps.grayscale(crop)
+        base_variants = [
+            crop,
+            gray,
+            ImageOps.autocontrast(gray),
+            ImageEnhance.Contrast(gray).enhance(2.2),
+            ImageEnhance.Sharpness(ImageOps.autocontrast(gray)).enhance(2.0),
+        ]
+        for item in base_variants:
+            for scale in (1, 2, 3):
+                resized = item if scale == 1 else item.resize((item.width * scale, item.height * scale))
+                variants.append(resized)
+                variants.append(resized.filter(ImageFilter.SHARPEN))
+                if resized.mode != "1":
+                    thresholded = ImageOps.grayscale(resized).point(lambda px: 255 if px > 145 else 0, mode="1")
+                    variants.append(thresholded)
+
+        for angle in (-6, -3, 3, 6):
+            rotated = crop.rotate(angle, expand=True, fillcolor="white")
+            variants.append(rotated)
+            variants.append(ImageOps.autocontrast(ImageOps.grayscale(rotated)))
+
+    # Çok büyük listeyi sınırlayıp aynı boyut/mod tekrarlarını azaltır.
+    unique = []
+    seen = set()
+    for variant in variants:
+        key = (variant.size, variant.mode)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(variant)
+    return unique[:90]
+
+
+def cv2_barcode_variants(image: Image.Image) -> list[Image.Image]:
+    if cv2 is None or np is None:
+        return []
+
+    variants = []
+    try:
+        rgb = np.array(ImageOps.exif_transpose(image).convert("RGB"))
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        gray = cv2.resize(gray, None, fx=2.2, fy=2.2, interpolation=cv2.INTER_CUBIC)
+        gray = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(gray)
+
+        processed_arrays = [
+            gray,
+            clahe,
+            cv2.threshold(clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1],
+            cv2.adaptiveThreshold(
+                clahe,
+                255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY,
+                31,
+                7,
+            ),
+        ]
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        processed_arrays.append(cv2.morphologyEx(processed_arrays[-1], cv2.MORPH_CLOSE, kernel))
+
+        for array in processed_arrays:
+            variants.append(Image.fromarray(array))
+    except Exception:
+        return []
+    return variants
+
+
 def decode_isbn_from_image(image_file) -> str:
     if not image_file:
         return ""
     try:
-        image = Image.open(image_file).convert("RGB")
-        decoded_items = decode(image)
-        for item in decoded_items:
-            candidate = item.data.decode("utf-8", errors="ignore").strip()
-            if normalize_isbn(candidate):
-                return candidate
+        if hasattr(image_file, "seek"):
+            image_file.seek(0)
+        image = Image.open(image_file)
     except Exception:
         return ""
+
+    for variant in [image, *pil_barcode_variants(image), *cv2_barcode_variants(image)]:
+        for payload in barcode_payloads_from_pil(variant):
+            isbn = isbn_from_barcode_payload(payload)
+            if isbn:
+                return isbn
     return ""
 
 
