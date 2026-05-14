@@ -7,7 +7,7 @@ import re
 import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
 
 import requests
 import streamlit as st
@@ -18,7 +18,7 @@ from supabase import Client, create_client
 
 
 APP_DIR = Path(__file__).resolve().parent
-APP_NAME = "Badger's Book App"
+APP_NAME = "Badgers' Kitap App"
 BRAND_IMAGE_PATHS = [
     APP_DIR / "assets" / "badger.png",
     APP_DIR / "badger.png",
@@ -123,7 +123,14 @@ TURKISH_RETAILERS = [
     ("BKM Kitap", "https://www.bkmkitap.com/arama?q={isbn}"),
     ("Kitapsepeti", "https://www.kitapsepeti.com/arama?q={isbn}"),
     ("Idefix", "https://www.idefix.com/search?q={isbn}"),
+    ("İkra Kitap", "https://www.ikrakitap.com/arama?q={isbn}"),
 ]
+
+DIRECT_ISBN_PAGES = [
+    ("Ucuzkitapal", "https://www.ucuzkitapal.com/{isbn}/"),
+]
+
+WEB_SEARCH_MAX_RESULTS = 8
 
 
 def get_secret(name: str, default: str = "") -> str:
@@ -234,6 +241,82 @@ def normalize_publisher_name(value: str) -> str:
         else:
             normalized_parts.append(part)
     return ", ".join(unique_keep_order(normalized_parts))
+
+
+def is_noise_text(value: str) -> bool:
+    value = clean_text(value)
+    if not value:
+        return True
+    key = canonical_key(value)
+    exact_noise = {
+        "listesi",
+        "yazar listesi",
+        "yayinevi listesi",
+        "kategori listesi",
+        "tum kategoriler",
+        "urunler",
+        "menuler",
+        "menu",
+        "hesabim",
+        "sepetim",
+        "uye girisi",
+        "giris yap",
+        "kayit ol",
+        "yorum yap",
+        "alisveris listeme ekle",
+        "favorilerime ekle",
+        "sepete ekle",
+        "devamini oku",
+        "sonuc bulunamadi",
+        "input",
+        "button",
+    }
+    if key in exact_noise:
+        return True
+    if len(value) > 180:
+        return True
+    if re.fullmatch(r"[%\d\s.,]+(tl|₺|eur|usd)?", key):
+        return True
+    noisy_starts = (
+        "kitapyurdu fiyati",
+        "uretici liste fiyati",
+        "liste fiyati",
+        "kazanciniz",
+        "parapuan",
+        "satis rakamlari",
+        "stokta",
+        "kargo",
+    )
+    return any(key.startswith(prefix) for prefix in noisy_starts)
+
+
+def is_bad_title(title: str, variants: list[str] | None = None, source: str = "") -> bool:
+    title = clean_text(title)
+    if is_noise_text(title):
+        return True
+    key = canonical_key(title)
+    source_key = canonical_key(source)
+    bad_phrases = (
+        "arama",
+        "search",
+        "sonuc",
+        "kitap bkmkitap bir kitapla mumkun",
+        "kitapla bulusmanin en kolay yolu",
+        "isbn search",
+    )
+    if any(phrase in key for phrase in bad_phrases):
+        return True
+    if variants and any(variant and variant in only_digits(title) for variant in variants):
+        if source_key and source_key in key:
+            return True
+        if any(phrase in key for phrase in ("arama", "search", "isbn")) and len(key.split()) <= 8:
+            return True
+    return False
+
+
+def clean_field_value(value: str) -> str:
+    value = clean_text(value)
+    return "" if is_noise_text(value) else value
 
 
 def parse_tags(value) -> list[str]:
@@ -732,11 +815,12 @@ def record_from_jsonld(obj: dict, variants: list[str], source: str, url: str) ->
         return None
 
     serialized = json.dumps(obj, ensure_ascii=False)
-    if has_isbn_field and not variant_in_text(variants, serialized):
+    isbn_matched = variant_in_text(variants, serialized)
+    if has_isbn_field and not isbn_matched:
         return None
 
     title = clean_text(obj.get("name") or obj.get("headline"))
-    if not title:
+    if not title or is_bad_title(title, variants, source):
         return None
 
     book = blank_book(variants[0])
@@ -749,9 +833,10 @@ def record_from_jsonld(obj: dict, variants: list[str], source: str, url: str) ->
             "cover_url": image_to_url(obj.get("image")),
             "source_url": url,
             "_source": source,
+            "_isbn_matched": isbn_matched,
         }
     )
-    return book
+    return sanitize_scraped_record(book, variants, source)
 
 
 def meta_content(soup: BeautifulSoup, *names: str) -> str:
@@ -774,52 +859,282 @@ def line_value(lines: list[str], labels: list[str]) -> str:
         "ebat",
         "baskı sayısı",
         "dil",
+        "isbn",
     }
     for index, line in enumerate(lines):
         folded = line.casefold()
         for label, folded_label in zip(labels, label_set):
             if folded.startswith(folded_label):
                 value = clean_text(line[len(label):].strip(" :;-"))
-                if value and value.casefold() not in blocked_next_words and len(value) < 150:
+                if (
+                    value
+                    and value.casefold() not in blocked_next_words
+                    and not is_noise_text(value)
+                    and len(value) < 150
+                ):
                     return value
                 if index + 1 < len(lines):
                     next_line = clean_text(lines[index + 1])
-                    if next_line and next_line.casefold() not in blocked_next_words and len(next_line) < 150:
+                    if (
+                        next_line
+                        and next_line.casefold() not in blocked_next_words
+                        and not is_noise_text(next_line)
+                        and len(next_line) < 150
+                    ):
                         return next_line
     return ""
 
 
+def looks_like_search_page(url: str, title: str = "") -> bool:
+    parsed = urlparse(url)
+    path_query = canonical_key(f"{parsed.path} {parsed.query} {title}")
+    search_tokens = (
+        "arama",
+        "search",
+        "route product search",
+        "filter name",
+        "q ",
+        "query",
+        "sonuc",
+        "category",
+        "kategori",
+    )
+    return any(token in path_query for token in search_tokens)
+
+
+def looks_like_publisher(value: str) -> bool:
+    key = canonical_key(value)
+    return any(
+        token in key
+        for token in (
+            "yayinevi",
+            "yayinlari",
+            "yayincilik",
+            "kitap",
+            "press",
+            "publishing",
+            "nesriyat",
+            "timas",
+            "say",
+        )
+    )
+
+
+def context_lines_after_title(lines: list[str], title: str) -> list[str]:
+    title_key = canonical_key(title)
+    if not title_key:
+        return []
+    for index, line in enumerate(lines):
+        line_key = canonical_key(line)
+        if line_key == title_key or title_key in line_key or line_key in title_key:
+            result = []
+            for next_line in lines[index + 1 : index + 10]:
+                if is_noise_text(next_line):
+                    continue
+                if variant_in_text([], next_line):
+                    continue
+                result.append(next_line)
+            return result
+    return []
+
+
+def clean_context_lines(lines: list[str]) -> list[str]:
+    cleaned = []
+    for line in lines:
+        line = clean_text(line)
+        if not line or is_noise_text(line):
+            continue
+        if canonical_key(line) in {"isbn", "barkod", "ean"}:
+            continue
+        cleaned.append(line)
+    return unique_keep_order(cleaned)
+
+
+def enrich_from_title_context(book: dict, lines: list[str], source: str) -> dict:
+    title = clean_text(book.get("title"))
+    following = clean_context_lines(context_lines_after_title(lines, title))
+    if not following:
+        return book
+
+    source_key = canonical_key(source)
+    author = clean_field_value(book.get("author"))
+    publisher = clean_field_value(book.get("publisher"))
+
+    if "bkm" in source_key:
+        if not publisher and len(following) >= 1:
+            publisher = following[0]
+        if not author and len(following) >= 2:
+            author = following[1]
+    elif "ikra" in source_key:
+        if not author and len(following) >= 1:
+            author = following[0]
+        if not publisher and len(following) >= 2:
+            publisher = following[1]
+    else:
+        if not publisher:
+            publisher = next((line for line in following[:4] if looks_like_publisher(line)), "")
+        if not author:
+            if publisher and publisher in following:
+                pub_index = following.index(publisher)
+                candidates = following[:pub_index] + following[pub_index + 1 :]
+            else:
+                candidates = following
+            author = next(
+                (
+                    line
+                    for line in candidates[:4]
+                    if not looks_like_publisher(line) and not variant_in_text([book.get("isbn", "")], line)
+                ),
+                "",
+            )
+
+    if author:
+        book["author"] = dedupe_comma_values(author)
+    if publisher:
+        book["publisher"] = normalize_publisher_name(publisher)
+    return book
+
+
+def parse_isbn_detail_line(line: str, book: dict, variants: list[str]) -> dict:
+    if not variant_in_text(variants, line):
+        return book
+    parts = [clean_text(part) for part in line.split("|")]
+    parts = [part for part in parts if part]
+    for part in parts:
+        if variant_in_text(variants, part):
+            continue
+        if re.fullmatch(r"\d{2,4}", only_digits(part)) and not book.get("page_count"):
+            book["page_count"] = only_digits(part)
+        elif canonical_key(part) in {"turkce", "tr", "turkish"} and not book.get("language"):
+            book["language"] = "Türkçe"
+        elif "kağıt" in part.casefold() or "kagit" in canonical_key(part):
+            book["paper_type"] = part
+        elif not book.get("paper_type") and "hamur" in canonical_key(part):
+            book["paper_type"] = part
+    return book
+
+
+def record_from_isbn_context(lines: list[str], variants: list[str], source: str, url: str, title_hint: str = "") -> dict | None:
+    for index, line in enumerate(lines):
+        if not variant_in_text(variants, line):
+            continue
+
+        before = clean_context_lines(lines[max(0, index - 10) : index])
+        after = clean_context_lines(lines[index + 1 : index + 10])
+        window = before + [line] + after
+
+        author = line_value(window, ["Yazar", "Yazarlar", "Author"])
+        publisher = normalize_publisher_name(
+            line_value(window, ["Yayınevi", "Yayıncı", "Yayinevi", "Publisher"])
+        )
+        translator = line_value(window, ["Çevirmen", "Cevirmen", "Translator"])
+
+        title = "" if is_bad_title(title_hint, variants, source) else clean_text(title_hint)
+        if not title:
+            if publisher and publisher in before:
+                pub_index = before.index(publisher)
+                title_candidates = before[:pub_index]
+            else:
+                title_candidates = before
+            for candidate in reversed(title_candidates):
+                if (
+                    not is_bad_title(candidate, variants, source)
+                    and not looks_like_publisher(candidate)
+                    and not canonical_key(candidate).startswith("yazar")
+                    and candidate != author
+                ):
+                    title = candidate
+                    break
+
+        if not title:
+            continue
+
+        if not publisher:
+            publisher = next((candidate for candidate in before if looks_like_publisher(candidate)), "")
+        if not author:
+            candidates = [candidate for candidate in before if candidate not in {title, publisher}]
+            author = next((candidate for candidate in reversed(candidates) if not looks_like_publisher(candidate)), "")
+
+        book = blank_book(variants[0])
+        book.update(
+            {
+                "title": title,
+                "author": dedupe_comma_values(author),
+                "translator": dedupe_comma_values(translator),
+                "publisher": normalize_publisher_name(publisher),
+                "page_count": line_value(window, ["Sayfa Sayısı", "Sayfa", "Pages"]),
+                "paper_type": line_value(window, ["Hamur Tipi", "Kağıt", "Kağıt Cinsi", "Kagit Cinsi"]),
+                "dimensions": line_value(window, ["Ebat", "Boyut", "Kitap Boyutu", "Boyutlar"]),
+                "first_print_year": first_year(
+                    line_value(window, ["İlk Baskı Yılı", "Basım Tarihi", "Basım Yılı", "Yayın Tarihi"])
+                ),
+                "print_edition": line_value(window, ["Baskı", "Baskı Sayısı", "Baski Sayisi"]),
+                "language": pretty_language(line_value(window, ["Dil", "Yayın Dili", "Kitap Dili", "Basım Dili"])),
+                "source_url": url,
+                "_source": f"{source} ISBN bağlamı",
+                "_isbn_matched": True,
+            }
+        )
+        book = parse_isbn_detail_line(line, book, variants)
+        return sanitize_scraped_record(book, variants, source)
+    return None
+
+
+def sanitize_scraped_record(record: dict, variants: list[str], source: str) -> dict | None:
+    if not record:
+        return None
+    if is_bad_title(record.get("title"), variants, source):
+        return None
+    for field in ("author", "translator", "publisher"):
+        record[field] = clean_field_value(record.get(field))
+    record["author"] = dedupe_comma_values(record.get("author"))
+    record["translator"] = dedupe_comma_values(record.get("translator"))
+    record["publisher"] = normalize_publisher_name(record.get("publisher"))
+    return record
+
+
 def extract_book_from_html(html: str, variants: list[str], source: str, url: str) -> dict | None:
     soup = BeautifulSoup(html, "html.parser")
+    page_text = soup.get_text(" ")
+    page_has_isbn = variant_in_text(variants, page_text)
+    lines = [clean_text(line) for line in soup.get_text("\n").splitlines()]
+    lines = [line for line in lines if line]
+
+    h1_title = clean_text(soup.find("h1").get_text(" ") if soup.find("h1") else "")
+    meta_title = clean_text(meta_content(soup, "og:title", "twitter:title"))
+    document_title = clean_text(soup.title.get_text(" ") if soup.title else "")
+    title_hint = h1_title or meta_title or document_title
+    search_page = looks_like_search_page(url, title_hint)
+
     records = []
 
     for obj in jsonld_objects(soup):
         record = record_from_jsonld(obj, variants, source, url)
-        if record:
+        if record and (page_has_isbn or record.get("_isbn_matched")):
             records.append(record)
 
-    page_has_isbn = variant_in_text(variants, soup.get_text(" "))
-    if records and page_has_isbn:
-        return max(records, key=score_record)
-    if records:
-        return max(records, key=score_record)
+    context_record = record_from_isbn_context(lines, variants, source, url, title_hint=title_hint)
+    if context_record:
+        records.append(context_record)
+
+    if records and (page_has_isbn or any(record.get("_isbn_matched") for record in records)):
+        return sanitize_scraped_record(max(records, key=score_record), variants, source)
     if not page_has_isbn:
+        return None
+    if search_page:
         return None
 
     title = (
-        clean_text(meta_content(soup, "og:title", "twitter:title"))
-        or clean_text(soup.find("h1").get_text(" ") if soup.find("h1") else "")
-        or clean_text(soup.title.get_text(" ") if soup.title else "")
+        h1_title
+        or meta_title
+        or document_title
     )
     for separator in (" | ", " - "):
         if separator in title and source.casefold() in title.casefold():
             title = clean_text(title.split(separator)[0])
 
-    if not title or title.casefold() in {"arama", "search"}:
+    if is_bad_title(title, variants, source):
         return None
-
-    lines = [clean_text(line) for line in soup.get_text("\n").splitlines()]
-    lines = [line for line in lines if line]
 
     book = blank_book(variants[0])
     book.update(
@@ -831,23 +1146,45 @@ def extract_book_from_html(html: str, variants: list[str], source: str, url: str
                 line_value(lines, ["Yayınevi", "Yayıncı", "Yayinevi", "Publisher"])
             ),
             "page_count": line_value(lines, ["Sayfa Sayısı", "Sayfa", "Pages"]),
-            "paper_type": line_value(lines, ["Hamur Tipi", "Kağıt Cinsi", "Kagit Cinsi"]),
-            "dimensions": line_value(lines, ["Ebat", "Boyut", "Kitap Boyutu"]),
-            "first_print_year": first_year(line_value(lines, ["İlk Baskı Yılı", "Basım Yılı", "Yayın Tarihi"])),
-            "print_edition": line_value(lines, ["Baskı Sayısı", "Baski Sayisi"]),
-            "language": pretty_language(line_value(lines, ["Dil", "Kitap Dili", "Basım Dili"])),
+            "paper_type": line_value(lines, ["Hamur Tipi", "Kağıt", "Kağıt Cinsi", "Kagit Cinsi"]),
+            "dimensions": line_value(lines, ["Ebat", "Boyut", "Kitap Boyutu", "Boyutlar"]),
+            "first_print_year": first_year(
+                line_value(lines, ["İlk Baskı Yılı", "Basım Tarihi", "Basım Yılı", "Yayın Tarihi"])
+            ),
+            "print_edition": line_value(lines, ["Baskı", "Baskı Sayısı", "Baski Sayisi"]),
+            "language": pretty_language(line_value(lines, ["Dil", "Yayın Dili", "Kitap Dili", "Basım Dili"])),
             "cover_url": meta_content(soup, "og:image", "twitter:image"),
             "source_url": url,
             "_source": source,
+            "_isbn_matched": True,
         }
     )
-    return book if book["title"] else None
+    book = enrich_from_title_context(book, lines, source)
+    return sanitize_scraped_record(book, variants, source)
 
 
-def candidate_product_links(soup: BeautifulSoup, base_url: str) -> list[str]:
-    links = []
-    bad_tokens = ("sepet", "cart", "login", "uye", "üyelik", "arama", "search", "javascript:", "mailto:")
-    good_tokens = ("kitap", "urun", "ürün", "product", "/p/", "p-")
+def candidate_product_links(soup: BeautifulSoup, base_url: str, variants: list[str]) -> list[str]:
+    candidates = []
+    bad_tokens = (
+        "sepet",
+        "cart",
+        "login",
+        "uye",
+        "üyelik",
+        "arama",
+        "search",
+        "javascript:",
+        "mailto:",
+        "kategori",
+        "category",
+        "yazar",
+        "yayinevi",
+        "marka",
+        "kampanya",
+        "cok-satan",
+        "çok-satan",
+    )
+    good_tokens = ("kitap", "urun", "ürün", "product", "/p/", "p-", ".html")
 
     for anchor in soup.find_all("a", href=True):
         href = anchor["href"].strip()
@@ -856,12 +1193,28 @@ def candidate_product_links(soup: BeautifulSoup, base_url: str) -> list[str]:
         if any(token in folded for token in bad_tokens):
             continue
         link_text = clean_text(anchor.get_text(" "))
-        if any(token in folded for token in good_tokens) or len(link_text) > 3:
-            if full_url not in links:
-                links.append(full_url)
-        if len(links) >= 5:
+        if is_noise_text(link_text):
+            continue
+        score = 0
+        if any(variant and variant in only_digits(full_url + " " + link_text) for variant in variants):
+            score += 10
+        if any(token in folded for token in good_tokens):
+            score += 4
+        path_parts = [part for part in urlparse(full_url).path.split("/") if part]
+        if len(path_parts) == 1 and len(path_parts[0]) > 3:
+            score += 2
+        if len(link_text) > 3:
+            score += 1
+        if score > 0:
+            candidates.append((score, full_url))
+
+    ordered = []
+    for _, link in sorted(candidates, key=lambda item: item[0], reverse=True):
+        if link not in ordered:
+            ordered.append(link)
+        if len(ordered) >= 24:
             break
-    return links
+    return ordered
 
 
 def search_turkish_retailers(variants: list[str]) -> list[dict]:
@@ -881,7 +1234,7 @@ def search_turkish_retailers(variants: list[str]) -> list[dict]:
                 break
 
             soup = BeautifulSoup(html, "html.parser")
-            for link in candidate_product_links(soup, final_url)[:3]:
+            for link in candidate_product_links(soup, final_url, variants)[:10]:
                 product_url, product_html = http_get_html(link)
                 if not product_html:
                     continue
@@ -895,8 +1248,95 @@ def search_turkish_retailers(variants: list[str]) -> list[dict]:
     return records
 
 
+def search_direct_isbn_pages(variants: list[str]) -> list[dict]:
+    records = []
+    for source, template in DIRECT_ISBN_PAGES:
+        for isbn in variants:
+            final_url, html = http_get_html(template.format(isbn=isbn))
+            if not html:
+                continue
+            record = extract_book_from_html(html, variants, source, final_url)
+            if record:
+                records.append(record)
+                break
+    return records
+
+
+def unwrap_search_result_url(href: str, base_url: str) -> str:
+    full_url = urljoin(base_url, href)
+    parsed = urlparse(full_url)
+    query = parse_qs(parsed.query)
+    for key in ("uddg", "url", "u"):
+        if query.get(key):
+            return unquote(query[key][0])
+    return full_url
+
+
+def source_name_from_url(url: str) -> str:
+    host = urlparse(url).netloc.lower().replace("www.", "")
+    if not host:
+        return "Web"
+    return host.split(":")[0]
+
+
+def should_skip_web_result(url: str) -> bool:
+    parsed = urlparse(url)
+    host_path = canonical_key(f"{parsed.netloc} {parsed.path}")
+    blocked = (
+        "google",
+        "duckduckgo",
+        "youtube",
+        "facebook",
+        "instagram",
+        "twitter",
+        "x com",
+        "linkedin",
+        "pinterest",
+        "sikayetvar",
+        "pdf",
+        "login",
+        "cart",
+        "sepet",
+    )
+    return not parsed.scheme.startswith("http") or any(token in host_path for token in blocked)
+
+
+def search_web_for_isbn_pages(variants: list[str]) -> list[dict]:
+    """Son şans: ISBN'i web arama sonucu olarak bulup sayfaları tek tek doğrular."""
+    records = []
+    seen_links = set()
+    primary_isbn = variants[0]
+    search_url = f"https://duckduckgo.com/html/?q={quote_plus(f'\"{primary_isbn}\" kitap ISBN')}"
+    final_url, html = http_get_html(search_url)
+    if not html:
+        return records
+
+    soup = BeautifulSoup(html, "html.parser")
+    links = []
+    for anchor in soup.find_all("a", href=True):
+        link = unwrap_search_result_url(anchor["href"], final_url)
+        if should_skip_web_result(link) or link in seen_links:
+            continue
+        seen_links.add(link)
+        links.append(link)
+        if len(links) >= WEB_SEARCH_MAX_RESULTS:
+            break
+
+    for link in links:
+        page_url, page_html = http_get_html(link)
+        if not page_html:
+            continue
+        source = source_name_from_url(page_url)
+        record = extract_book_from_html(page_html, variants, source, page_url)
+        if record:
+            records.append(record)
+    return records
+
+
 # --- KAYITLARI BIRLESTIRME ---
 def score_record(record: dict) -> int:
+    if is_bad_title(record.get("title"), [record.get("isbn", "")], record.get("_source", "")):
+        return 0
     weights = {
         "title": 10,
         "author": 6,
@@ -913,7 +1353,13 @@ def score_record(record: dict) -> int:
 
 
 def merge_records(normalized: dict, records: list[dict]) -> dict | None:
-    usable = [record for record in records if clean_text(record.get("title"))]
+    usable = [
+        record
+        for record in records
+        if clean_text(record.get("title"))
+        and not is_bad_title(record.get("title"), normalized.get("variants", []), record.get("_source", ""))
+        and score_record(record) > 0
+    ]
     if not usable:
         return None
 
@@ -952,10 +1398,15 @@ def get_book_info_comprehensive(raw_isbn: str) -> dict:
     records.extend(search_google_books(variants))
     records.extend(search_openlibrary(variants))
     records.extend(search_isbndb(variants))
+    records.extend(search_direct_isbn_pages(variants))
 
     merged = merge_records(normalized, records)
     if not merged or merged["_score"] < 18 or not merged.get("publisher") or not merged.get("page_count"):
         records.extend(search_turkish_retailers(variants))
+        merged = merge_records(normalized, records)
+
+    if not merged or merged["_score"] < 18 or not merged.get("title"):
+        records.extend(search_web_for_isbn_pages(variants))
         merged = merge_records(normalized, records)
 
     if merged:
