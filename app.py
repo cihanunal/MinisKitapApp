@@ -15,11 +15,15 @@ from pyzbar.pyzbar import decode
 from supabase import Client, create_client
 
 
-# --- KONFIGURASYON VE BAGLANTI ---
-st.set_page_config(page_title="MinisKitapApp", page_icon="📚", layout="wide")
-
 APP_DIR = Path(__file__).resolve().parent
-BRAND_IMAGE_PATH = APP_DIR / "assets" / "badger.png"
+APP_NAME = "Badgers' Kitap App"
+BRAND_IMAGE_PATHS = [
+    APP_DIR / "assets" / "badger.png",
+    APP_DIR / "badger.png",
+]
+
+# --- KONFIGURASYON VE BAGLANTI ---
+st.set_page_config(page_title=APP_NAME, page_icon="📚", layout="wide")
 
 HTTP_HEADERS = {
     "User-Agent": (
@@ -1131,7 +1135,7 @@ def books_to_csv(books: list[dict]) -> str:
 
 def backup_json(books: list[dict]) -> str:
     payload = {
-        "app": "MinisKitapApp",
+        "app": APP_NAME,
         "schema_version": 2,
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "book_count": len(books),
@@ -1173,10 +1177,12 @@ def set_page(page: str):
 def render_top_bar():
     left, right = st.columns([0.82, 0.18], vertical_alignment="center")
     with left:
-        if BRAND_IMAGE_PATH.exists():
-            st.image(str(BRAND_IMAGE_PATH), width=170)
+        brand_image = next((path for path in BRAND_IMAGE_PATHS if path.exists()), None)
+        if brand_image:
+            st.image(str(brand_image), width=170)
+            st.markdown(f"### {APP_NAME}")
         else:
-            st.title("MinisKitapApp")
+            st.title(APP_NAME)
     with right:
         st.write("")
         if st.button("➕ Kitap Ekle", use_container_width=True, key="top_add_book"):
@@ -1185,7 +1191,7 @@ def render_top_bar():
 
 
 def render_sidebar(all_books: list[dict]):
-    st.sidebar.title("📚 MinisKitapApp")
+    st.sidebar.title(f"📚 {APP_NAME}")
 
     current = st.session_state.get("page", "library")
     labels = list(PAGE_LABELS.values())
@@ -1218,7 +1224,7 @@ def render_sidebar(all_books: list[dict]):
 
     st.sidebar.divider()
     st.sidebar.subheader("Yedek")
-    backup_name = f"miniskitapapp_yedek_{datetime.now().strftime('%Y%m%d_%H%M')}"
+    backup_name = f"badgers_kitap_app_yedek_{datetime.now().strftime('%Y%m%d_%H%M')}"
     st.sidebar.download_button(
         "Kitaplığımın yedek bilgilerini al (JSON)",
         data=backup_json(all_books),
