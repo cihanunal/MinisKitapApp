@@ -1,4 +1,6 @@
+import base64
 import csv
+import html
 import io
 import json
 import re
@@ -1151,6 +1153,48 @@ def inject_css():
         <style>
         .block-container { padding-top: 1.4rem; }
         [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p { margin-bottom: 0.25rem; }
+        .brand-wrap {
+            display: flex;
+            align-items: center;
+            gap: 1.25rem;
+            margin: 0.15rem 0 2rem 0;
+        }
+        .brand-logo-box {
+            width: 210px;
+            height: 210px;
+            padding: 14px;
+            border-radius: 14px;
+            background: #d8cbb8;
+            overflow: visible;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .brand-logo-box img {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            object-position: center center;
+            display: block;
+            border-radius: 8px;
+        }
+        .brand-title {
+            margin: 0;
+            font-size: 2rem;
+            line-height: 1.1;
+            font-weight: 750;
+        }
+        @media (max-width: 700px) {
+            .brand-wrap {
+                align-items: flex-start;
+                flex-direction: column;
+                gap: 0.8rem;
+            }
+            .brand-logo-box {
+                width: 170px;
+                height: 170px;
+            }
+        }
         .book-meta {
             color: rgba(250, 250, 250, 0.72);
             font-size: 0.95rem;
@@ -1174,13 +1218,29 @@ def set_page(page: str):
     st.session_state["page"] = page
 
 
+def local_image_data_uri(path: Path) -> str:
+    suffix = path.suffix.lower().lstrip(".") or "png"
+    mime = "jpeg" if suffix in {"jpg", "jpeg"} else suffix
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:image/{mime};base64,{encoded}"
+
+
 def render_top_bar():
     left, right = st.columns([0.82, 0.18], vertical_alignment="center")
     with left:
         brand_image = next((path for path in BRAND_IMAGE_PATHS if path.exists()), None)
         if brand_image:
-            st.image(str(brand_image), width=170)
-            st.markdown(f"### {APP_NAME}")
+            st.markdown(
+                f"""
+                <div class="brand-wrap">
+                    <div class="brand-logo-box">
+                        <img src="{local_image_data_uri(brand_image)}" alt="{html.escape(APP_NAME)} logosu">
+                    </div>
+                    <h1 class="brand-title">{html.escape(APP_NAME)}</h1>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
         else:
             st.title(APP_NAME)
     with right:
