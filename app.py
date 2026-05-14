@@ -30,7 +30,7 @@ except Exception:
 
 
 APP_DIR = Path(__file__).resolve().parent
-APP_NAME = "Badgers' Kitap App"
+APP_NAME = "Badger's Book App"
 BRAND_IMAGE_PATHS = [
     APP_DIR / "assets" / "badger.png",
     APP_DIR / "badger.png",
