@@ -4,3 +4,4 @@ requests
 pyzbar
 Pillow
 pandas
+beautifulsoup4
