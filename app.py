@@ -1888,18 +1888,25 @@ def render_top_bar():
             st.rerun()
 
 
-def render_sidebar(all_books: list[dict]):
+def render_sidebar(all_books: list[dict] | None = None):
     st.sidebar.title(f"📚 {APP_NAME}")
 
-    current = st.session_state.get("page", "library")
+    current = st.session_state.get("page", "add")
     labels = list(PAGE_LABELS.values())
     reverse_labels = {value: key for key, value in PAGE_LABELS.items()}
     selected_label = st.sidebar.radio(
         "Menü",
         labels,
-        index=labels.index(PAGE_LABELS.get(current, PAGE_LABELS["library"])),
+        index=labels.index(PAGE_LABELS.get(current, PAGE_LABELS["add"])),
     )
-    st.session_state["page"] = reverse_labels[selected_label]
+    selected_page = reverse_labels[selected_label]
+    st.session_state["page"] = selected_page
+
+    if selected_page != "library":
+        return "Tümü", "Tümü", "Tüm Etiketler", "", "Eser Adı (A-Z)", []
+
+    if all_books is None:
+        all_books = fetch_books()
 
     st.sidebar.divider()
     st.sidebar.subheader("Kişisel Filtreler")
@@ -1941,7 +1948,7 @@ def render_sidebar(all_books: list[dict]):
         st.cache_data.clear()
         st.sidebar.success("Arama önbelleği temizlendi.")
 
-    return personal_filter, status_filter, tag_filter, search_term, sort_by
+    return personal_filter, status_filter, tag_filter, search_term, sort_by, all_books
 
 
 def render_cover(cover_url: str, width: int = 120):
@@ -2281,9 +2288,137 @@ def bulk_row_to_book_data(row: dict, auto_lookup: bool) -> tuple[dict | None, bo
     return data, lookup_used
 
 
+def process_bulk_barcode_images(image_files: list, save_unresolved: bool = True) -> dict:
+    result = {
+        "decoded": [],
+        "inserted": [],
+        "unresolved": [],
+        "duplicates": [],
+        "unreadable": [],
+        "errors": [],
+    }
+    seen_isbns = set()
+
+    for index, image_file in enumerate(image_files[:10], start=1):
+        label = getattr(image_file, "name", "") or f"Barkod {index}"
+        isbn = decode_isbn_from_image(image_file)
+        if not isbn:
+            result["unreadable"].append(label)
+            continue
+
+        isbn = normalize_lookup_isbn(isbn)
+        if isbn in seen_isbns:
+            result["duplicates"].append(isbn)
+            continue
+        seen_isbns.add(isbn)
+        result["decoded"].append(isbn)
+
+        if isbn_exists(isbn):
+            result["duplicates"].append(isbn)
+            continue
+
+        lookup = get_book_info_comprehensive(isbn, cache_version=LOOKUP_CACHE_VERSION + 1)
+        if lookup.get("ok") and lookup.get("book", {}).get("title"):
+            book_data = lookup["book"]
+            book_data["isbn"] = isbn
+            if insert_book(book_data):
+                result["inserted"].append(
+                    {
+                        "isbn": isbn,
+                        "title": clean_text(book_data.get("title")),
+                    }
+                )
+            else:
+                result["errors"].append(isbn)
+        else:
+            result["unresolved"].append(isbn)
+            if save_unresolved:
+                save_pending_isbn(isbn, note="Toplu barkod okutma sırasında bulunamadı", source="bulk_barcode")
+
+    return result
+
+
+def render_bulk_barcode_section():
+    with st.expander("Toplu Barkod Okutma", expanded=True):
+        st.caption("En fazla 10 barkod fotoğrafını tek seferde işleyebilirsin.")
+        uploaded_files = st.file_uploader(
+            "Barkod fotoğraflarını yükle",
+            type=["png", "jpg", "jpeg"],
+            accept_multiple_files=True,
+            key="bulk_barcode_uploads",
+        )
+        show_camera_slots = st.checkbox("Kamera ile 10 barkod kutusu göster", value=False)
+
+        camera_files = []
+        if show_camera_slots:
+            for row_index in range(5):
+                col1, col2 = st.columns(2)
+                with col1:
+                    captured = st.camera_input(
+                        f"Barkod {row_index * 2 + 1}",
+                        key=f"bulk_barcode_camera_{row_index * 2 + 1}",
+                    )
+                    if captured:
+                        camera_files.append(captured)
+                with col2:
+                    captured = st.camera_input(
+                        f"Barkod {row_index * 2 + 2}",
+                        key=f"bulk_barcode_camera_{row_index * 2 + 2}",
+                    )
+                    if captured:
+                        camera_files.append(captured)
+
+        save_unresolved_barcodes = st.checkbox(
+            "Bulunamayan barkodları Sonra Aranacaklar listesine kaydet",
+            value=True,
+            key="bulk_barcode_save_unresolved",
+        )
+        image_files = list(uploaded_files or []) + camera_files
+        if len(image_files) > 10:
+            st.warning("İlk 10 barkod işlenecek.")
+
+        if st.button("Barkodları Oku, Ara ve Ekle", type="primary", use_container_width=True):
+            if not image_files:
+                st.warning("Önce barkod fotoğrafı ekle.")
+                return
+
+            with st.spinner("Barkodlar okunuyor, kitap bilgileri aranıyor ve kayıt yapılıyor..."):
+                result = process_bulk_barcode_images(image_files, save_unresolved=save_unresolved_barcodes)
+            st.session_state["last_bulk_barcode_result"] = result
+
+        result = st.session_state.get("last_bulk_barcode_result")
+        if not result:
+            return
+
+        st.success(f"{len(result['inserted'])} kitap eklendi.")
+        if result["inserted"]:
+            st.write("**Eklenenler:**")
+            for item in result["inserted"]:
+                st.write(f"- {item['isbn']} · {item['title']}")
+        if result["unresolved"]:
+            st.warning("Bulunamayan ISBN'ler:")
+            for isbn in result["unresolved"]:
+                st.markdown(f"- `{isbn}` · [Google'da ara]({google_search_url_for_isbn(isbn)})")
+        if result["unreadable"]:
+            st.warning("Barkodu okunamayan görseller:")
+            for name in result["unreadable"]:
+                st.write(f"- {name}")
+        if result["duplicates"]:
+            st.info("Tekrar veya zaten kayıtlı olan ISBN'ler:")
+            for isbn in unique_keep_order(result["duplicates"]):
+                st.write(f"- {isbn}")
+        if result["errors"]:
+            st.error("Kayıt sırasında hata alınan ISBN'ler:")
+            for isbn in result["errors"]:
+                st.write(f"- {isbn}")
+
+
 def render_bulk_add_page():
     st.header("Toplu Kitap Ekle")
     st.caption("25 satırı tek seferde doldurup kaydedebilirsin. Boş satırlar yok sayılır.")
+
+    render_bulk_barcode_section()
+    st.divider()
 
     auto_lookup = st.checkbox(
         "ISBN yazdığım satırlarda boş bilgileri internetten doldurmayı dene",
@@ -2405,22 +2540,30 @@ def render_library_page(all_books: list[dict], filters: tuple):
 
 def render_add_page():
     st.header("Yeni Kitap Ekle")
+    add_nonce = st.session_state.get("add_nonce", 0)
 
     camera_col, manual_col = st.columns([0.48, 0.52])
     with camera_col:
         img_file = st.camera_input(
             "Barkodu Okutun",
-            key="barcode_camera",
+            key=f"barcode_camera_{add_nonce}",
             help="Streamlit kamera bileşeni arka kamerayı kesin zorlayamaz; mobil tarayıcı destekliyorsa arka kamerayı seçebilirsin.",
         )
         uploaded_barcode = st.file_uploader(
             "Barkod fotoğrafı yükle",
             type=["png", "jpg", "jpeg"],
-            key="barcode_upload",
+            key=f"barcode_upload_{add_nonce}",
         )
     with manual_col:
-        isbn_input = st.text_input("ISBN numarasını manuel girin", placeholder="9786052361917")
-        manual_without_isbn = st.checkbox("ISBN olmadan manuel kitap ekle")
+        isbn_input = st.text_input(
+            "ISBN numarasını manuel girin",
+            placeholder="9786052361917",
+            key=f"isbn_input_{add_nonce}",
+        )
+        manual_without_isbn = st.checkbox(
+            "ISBN olmadan manuel kitap ekle",
+            key=f"manual_without_isbn_{add_nonce}",
+        )
 
     target_isbn = ""
     decoded_camera = decode_isbn_from_image(img_file)
@@ -2490,7 +2633,7 @@ def render_add_page():
 
     with st.form("save_book_form"):
         st.subheader("Kitap Detayları")
-        data = build_form_data("new_book", book_info)
+        data = build_form_data(f"new_book_{add_nonce}", book_info)
         if target_isbn:
             normalized = normalize_isbn(target_isbn)
             data["isbn"] = normalized["isbn13"] if normalized else only_digits(target_isbn)
@@ -2508,7 +2651,8 @@ def render_add_page():
 
         if insert_book(data):
             st.success(f"'{clean_text(data['title'])}' kütüphaneye eklendi.")
-            set_page("library")
+            set_page("add")
+            st.session_state["add_nonce"] = add_nonce + 1
             st.rerun()
 
 
@@ -2579,10 +2723,12 @@ def render_lookup_queue_page():
 inject_css()
 
 if "page" not in st.session_state:
-    st.session_state["page"] = "library"
+    st.session_state["page"] = "add"
+if "add_nonce" not in st.session_state:
+    st.session_state["add_nonce"] = 0
 
-all_books = fetch_books()
-filters = render_sidebar(all_books)
+filters = render_sidebar()
+all_books = filters[5]
 render_top_bar()
 
 if st.session_state.get("page") == "add":
@@ -2592,4 +2738,4 @@ elif st.session_state.get("page") == "bulk_add":
 elif st.session_state.get("page") == "lookup_queue":
     render_lookup_queue_page()
 else:
-    render_library_page(all_books, filters)
+    render_library_page(all_books, filters[:5])
