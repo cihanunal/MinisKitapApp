@@ -1644,14 +1644,24 @@ def fetch_books() -> list[dict]:
 
 def fetch_book_index() -> list[dict]:
     """Hızlı arama için sadece hafif alanları çeker."""
+    page_size = 1000
+    start = 0
+    rows = []
     try:
-        response = (
-            supabase.table("books")
-            .select("id,isbn,title,author")
-            .order("title")
-            .execute()
-        )
-        return response.data or []
+        while True:
+            response = (
+                supabase.table("books")
+                .select("id,isbn,title,author")
+                .order("title")
+                .range(start, start + page_size - 1)
+                .execute()
+            )
+            batch = response.data or []
+            rows.extend(batch)
+            if len(batch) < page_size:
+                break
+            start += page_size
+        return rows
     except Exception as exc:
         st.warning(f"Hızlı arama listesi yüklenemedi: {exc}")
         return []
@@ -2357,8 +2367,8 @@ def render_quick_search_page(book_index: list[dict]):
     )
 
     if not search_term:
-        st.info("Aramak için kitap adı, yazar veya barkod yaz.")
-        preview = book_index[:25]
+        st.info("Arama kutusu boşken tüm hızlı indeks gösteriliyor.")
+        preview = book_index
     else:
         needle = canonical_key(search_term)
         digit_needle = only_digits(search_term)
@@ -2387,11 +2397,10 @@ def render_quick_search_page(book_index: list[dict]):
             "Kitap Adı": clean_text(book.get("title")),
             "Yazar": clean_text(book.get("author")),
         }
-        for book in preview[:100]
+        for book in preview
     ]
     st.dataframe(rows, use_container_width=True, hide_index=True)
-    if len(preview) > 100:
-        st.caption(f"İlk 100 sonuç gösteriliyor. Toplam eşleşme: {len(preview)}")
+    st.caption(f"Gösterilen kayıt: {len(preview)}")
 
 
 def blank_bulk_rows(count: int = 25) -> list[dict]:
