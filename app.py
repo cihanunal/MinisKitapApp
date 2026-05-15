@@ -2715,13 +2715,28 @@ def render_ultimate_barcode_section():
                 },
             )
 
+            queue_unchecked = st.checkbox(
+                "Ekle tikini kaldırdıklarımı Sonra Aranacaklar listesine ekle",
+                value=True,
+                key="ultimate_queue_unchecked_found",
+            )
+
             if st.button("Seçili Bulunanları Kütüphaneye Ekle", use_container_width=True):
                 rows = editor_rows_to_list(edited_found)
                 book_by_isbn = {clean_text(book.get("isbn")): book for book in result["found"]}
                 inserted = 0
                 skipped = 0
+                queued_unchecked = 0
                 for row in rows:
                     if not row.get("ekle"):
+                        if queue_unchecked:
+                            isbn = clean_text(row.get("isbn"))
+                            if save_pending_isbn(
+                                isbn,
+                                note="Ultimate listede bulunan bilgi onaylanmadı",
+                                source="ultimate_unchecked",
+                            ):
+                                queued_unchecked += 1
                         continue
                     isbn = clean_text(row.get("isbn"))
                     book_data = dict(book_by_isbn.get(isbn, blank_book(isbn)))
@@ -2746,6 +2761,8 @@ def render_ultimate_barcode_section():
                 st.success(f"{inserted} kitap kütüphaneye eklendi.")
                 if skipped:
                     st.warning(f"{skipped} kitap zaten kayıtlı olduğu için atlandı.")
+                if queued_unchecked:
+                    st.info(f"{queued_unchecked} ISBN Sonra Aranacaklar listesine eklendi.")
 
         if result["unresolved"]:
             st.warning("Bulunamayan ISBN'ler:")
