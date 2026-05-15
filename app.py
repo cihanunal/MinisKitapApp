@@ -55,6 +55,7 @@ BULK_LOOKUP_TIMEOUT_SECONDS = 20
 PAGE_LABELS = {
     "library": "🏠 Kütüphanem",
     "add": "🔍 Kitap Ekle",
+    "quick_search": "⚡ Hızlı Arama",
     "bulk_add": "🧾 Toplu Kitap Ekle",
     "lookup_queue": "⏳ Sonra Aranacaklar",
 }
@@ -1641,6 +1642,21 @@ def fetch_books() -> list[dict]:
         return []
 
 
+def fetch_book_index() -> list[dict]:
+    """Hızlı arama için sadece hafif alanları çeker."""
+    try:
+        response = (
+            supabase.table("books")
+            .select("id,isbn,title,author")
+            .order("title")
+            .execute()
+        )
+        return response.data or []
+    except Exception as exc:
+        st.warning(f"Hızlı arama listesi yüklenemedi: {exc}")
+        return []
+
+
 def fetch_library_summary() -> dict:
     summary = {"count": 0, "recent": []}
     try:
@@ -2329,6 +2345,55 @@ def render_book_editor(book: dict):
                 st.rerun()
 
 
+def render_quick_search_page(book_index: list[dict]):
+    st.header("Hızlı Arama")
+    st.caption("Bu ekran sadece kitap adı, yazar ve barkod bilgisini kullanır; detaylı Kütüphanem ekranından çok daha hafif çalışır.")
+
+    st.metric("Hızlı listede kayıtlı kitap", len(book_index))
+    search_term = st.text_input(
+        "Kitap adı, yazar veya barkod yaz",
+        placeholder="Örn: Kürk Mantolu Madonna veya 978...",
+        key="quick_library_search",
+    )
+
+    if not search_term:
+        st.info("Aramak için kitap adı, yazar veya barkod yaz.")
+        preview = book_index[:25]
+    else:
+        needle = canonical_key(search_term)
+        digit_needle = only_digits(search_term)
+        preview = []
+        for book in book_index:
+            haystack = canonical_key(
+                " ".join(
+                    [
+                        clean_text(book.get("title")),
+                        clean_text(book.get("author")),
+                        clean_text(book.get("isbn")),
+                    ]
+                )
+            )
+            isbn_digits = only_digits(book.get("isbn"))
+            if needle in haystack or (digit_needle and digit_needle in isbn_digits):
+                preview.append(book)
+
+    if not preview:
+        st.warning("Bu aramada kütüphanede kayıtlı kitap görünmüyor.")
+        return
+
+    rows = [
+        {
+            "ISBN": clean_text(book.get("isbn")),
+            "Kitap Adı": clean_text(book.get("title")),
+            "Yazar": clean_text(book.get("author")),
+        }
+        for book in preview[:100]
+    ]
+    st.dataframe(rows, use_container_width=True, hide_index=True)
+    if len(preview) > 100:
+        st.caption(f"İlk 100 sonuç gösteriliyor. Toplam eşleşme: {len(preview)}")
+
+
 def blank_bulk_rows(count: int = 25) -> list[dict]:
     return [
         {
@@ -2403,6 +2468,7 @@ def process_bulk_barcode_images(image_files: list, save_unresolved: bool = True)
         "decoded": [],
         "inserted": [],
         "unresolved": [],
+        "queued": [],
         "duplicates": [],
         "unreadable": [],
         "errors": [],
@@ -2449,7 +2515,8 @@ def process_bulk_barcode_images(image_files: list, save_unresolved: bool = True)
         else:
             result["unresolved"].append(isbn)
             if save_unresolved:
-                save_pending_isbn(isbn, note="Toplu barkod okutma sırasında bulunamadı", source="bulk_barcode")
+                if save_pending_isbn(isbn, note="Toplu barkod okutma sırasında bulunamadı", source="bulk_barcode"):
+                    result["queued"].append(isbn)
 
     return result
 
@@ -2512,9 +2579,10 @@ def render_bulk_barcode_section():
             for item in result["inserted"]:
                 st.write(f"- {item['isbn']} · {item['title']}")
         if result["unresolved"]:
-            st.warning("Bulunamayan ISBN'ler:")
-            for isbn in result["unresolved"]:
-                st.markdown(f"- `{isbn}` · [Google'da ara]({google_search_url_for_isbn(isbn)})")
+            if result.get("queued"):
+                st.info(f"{len(result['queued'])} bulunamayan ISBN Sonra Aranacaklar listesine kaydedildi.")
+            else:
+                st.warning(f"{len(result['unresolved'])} ISBN bulunamadı. Sonra Aranacaklar seçeneğini açarsan kuyruğa kaydedilir.")
         if result["unreadable"]:
             st.warning("Barkodu okunamayan görseller:")
             for name in result["unreadable"]:
@@ -2645,7 +2713,7 @@ def render_ultimate_barcode_section():
 
             progress = st.progress(0)
             status_box = st.empty()
-            result = {"found": [], "unresolved": [], "existing": [], "errors": []}
+            result = {"found": [], "unresolved": [], "queued": [], "existing": [], "errors": []}
 
             for index, isbn in enumerate(isbns, start=1):
                 progress.progress(index / len(isbns))
@@ -2669,7 +2737,12 @@ def render_ultimate_barcode_section():
                 else:
                     result["unresolved"].append(isbn)
                     if save_unresolved:
-                        save_pending_isbn(isbn, note="Ultimate toplu barkod aramasında bulunamadı", source="ultimate_bulk")
+                        if save_pending_isbn(
+                            isbn,
+                            note="Ultimate toplu barkod aramasında bulunamadı",
+                            source="ultimate_bulk",
+                        ):
+                            result["queued"].append(isbn)
 
             status_box.success("Toplu arama tamamlandı.")
             st.session_state["ultimate_lookup_result"] = result
@@ -2765,9 +2838,10 @@ def render_ultimate_barcode_section():
                     st.info(f"{queued_unchecked} ISBN Sonra Aranacaklar listesine eklendi.")
 
         if result["unresolved"]:
-            st.warning("Bulunamayan ISBN'ler:")
-            for isbn in result["unresolved"]:
-                st.markdown(f"- `{isbn}` · [Google'da ara]({google_search_url_for_isbn(isbn)})")
+            if result.get("queued"):
+                st.info(f"{len(result['queued'])} bulunamayan ISBN Sonra Aranacaklar listesine kaydedildi.")
+            else:
+                st.warning(f"{len(result['unresolved'])} ISBN bulunamadı. Sonra Aranacaklar seçeneğini açarsan kuyruğa kaydedilir.")
 
         if result["existing"]:
             st.info("Zaten kütüphanede olan ISBN'ler:")
@@ -3120,12 +3194,15 @@ if "page" not in st.session_state:
 if "add_nonce" not in st.session_state:
     st.session_state["add_nonce"] = 0
 
+book_index = fetch_book_index()
 filters = render_sidebar()
 all_books = filters[5]
 render_top_bar()
 
 if st.session_state.get("page") == "add":
     render_add_page()
+elif st.session_state.get("page") == "quick_search":
+    render_quick_search_page(book_index)
 elif st.session_state.get("page") == "bulk_add":
     render_bulk_add_page()
 elif st.session_state.get("page") == "lookup_queue":
