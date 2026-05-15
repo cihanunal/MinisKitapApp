@@ -4,6 +4,7 @@ import html
 import io
 import json
 import re
+import time
 import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
@@ -49,6 +50,7 @@ HTTP_HEADERS = {
 
 REQUEST_TIMEOUT = 8
 LOOKUP_CACHE_VERSION = 4
+BULK_LOOKUP_TIMEOUT_SECONDS = 20
 
 PAGE_LABELS = {
     "library": "🏠 Kütüphanem",
@@ -564,13 +566,34 @@ def pretty_language(value: str) -> str:
 
 
 # --- HTTP YARDIMCILARI ---
-def http_get_json(url: str, params: dict | None = None, headers: dict | None = None) -> dict | None:
+def remaining_timeout(deadline: float | None, default_timeout: float = REQUEST_TIMEOUT) -> float | None:
+    if deadline is None:
+        return default_timeout
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    return max(0.8, min(default_timeout, remaining))
+
+
+def deadline_expired(deadline: float | None) -> bool:
+    return deadline is not None and time.monotonic() >= deadline
+
+
+def http_get_json(
+    url: str,
+    params: dict | None = None,
+    headers: dict | None = None,
+    deadline: float | None = None,
+) -> dict | None:
+    timeout = remaining_timeout(deadline)
+    if timeout is None:
+        return None
     try:
         response = requests.get(
             url,
             params=params,
             headers={**HTTP_HEADERS, **(headers or {})},
-            timeout=REQUEST_TIMEOUT,
+            timeout=timeout,
         )
         if response.status_code == 200:
             return response.json()
@@ -579,12 +602,15 @@ def http_get_json(url: str, params: dict | None = None, headers: dict | None = N
     return None
 
 
-def http_get_html(url: str) -> tuple[str, str]:
+def http_get_html(url: str, deadline: float | None = None) -> tuple[str, str]:
+    timeout = remaining_timeout(deadline)
+    if timeout is None:
+        return "", ""
     try:
         response = requests.get(
             url,
             headers=HTTP_HEADERS,
-            timeout=REQUEST_TIMEOUT,
+            timeout=timeout,
             allow_redirects=True,
         )
         if response.status_code == 200 and response.text:
@@ -640,12 +666,15 @@ def google_record_from_item(item: dict, isbn: str, variants: list[str]) -> dict 
     return book
 
 
-def search_google_books(variants: list[str]) -> list[dict]:
+def search_google_books(variants: list[str], deadline: float | None = None) -> list[dict]:
     records = []
     for isbn in variants:
+        if deadline_expired(deadline):
+            break
         data = http_get_json(
             "https://www.googleapis.com/books/v1/volumes",
             params={"q": f"isbn:{isbn}", "maxResults": 5, "printType": "books"},
+            deadline=deadline,
         )
         for item in (data or {}).get("items", []):
             record = google_record_from_item(item, variants[0], variants)
@@ -655,11 +684,11 @@ def search_google_books(variants: list[str]) -> list[dict]:
 
 
 # --- KAYNAK 2: OPEN LIBRARY ---
-def openlibrary_author_name(author_key: str) -> str:
+def openlibrary_author_name(author_key: str, deadline: float | None = None) -> str:
     if not author_key:
         return ""
     url = f"https://openlibrary.org{author_key}.json" if author_key.startswith("/") else author_key
-    data = http_get_json(url)
+    data = http_get_json(url, deadline=deadline)
     return clean_text((data or {}).get("name"))
 
 
@@ -686,14 +715,16 @@ def openlibrary_data_record(entry: dict, isbn: str) -> dict | None:
     return book
 
 
-def openlibrary_edition_record(edition: dict, isbn: str) -> dict | None:
+def openlibrary_edition_record(edition: dict, isbn: str, deadline: float | None = None) -> dict | None:
     title = clean_text(edition.get("title"))
     if not title:
         return None
 
     author_names = []
     for author in edition.get("authors", [])[:3]:
-        name = openlibrary_author_name(author.get("key", ""))
+        if deadline_expired(deadline):
+            break
+        name = openlibrary_author_name(author.get("key", ""), deadline=deadline)
         if name:
             author_names.append(name)
 
@@ -748,12 +779,15 @@ def openlibrary_search_record(doc: dict, isbn: str, variants: list[str]) -> dict
     return book
 
 
-def search_openlibrary(variants: list[str]) -> list[dict]:
+def search_openlibrary(variants: list[str], deadline: float | None = None) -> list[dict]:
     records = []
     for isbn in variants:
+        if deadline_expired(deadline):
+            break
         data = http_get_json(
             "https://openlibrary.org/api/books",
             params={"bibkeys": f"ISBN:{isbn}", "format": "json", "jscmd": "data"},
+            deadline=deadline,
         )
         entry = (data or {}).get(f"ISBN:{isbn}")
         if entry:
@@ -761,12 +795,16 @@ def search_openlibrary(variants: list[str]) -> list[dict]:
             if record:
                 records.append(record)
 
-        edition = http_get_json(f"https://openlibrary.org/isbn/{isbn}.json")
+        if deadline_expired(deadline):
+            break
+        edition = http_get_json(f"https://openlibrary.org/isbn/{isbn}.json", deadline=deadline)
         if edition:
-            record = openlibrary_edition_record(edition, variants[0])
+            record = openlibrary_edition_record(edition, variants[0], deadline=deadline)
             if record:
                 records.append(record)
 
+        if deadline_expired(deadline):
+            break
         search = http_get_json(
             "https://openlibrary.org/search.json",
             params={
@@ -777,6 +815,7 @@ def search_openlibrary(variants: list[str]) -> list[dict]:
                     "number_of_pages_median,isbn,cover_i,language,subject,key"
                 ),
             },
+            deadline=deadline,
         )
         for doc in (search or {}).get("docs", []):
             record = openlibrary_search_record(doc, variants[0], variants)
@@ -786,7 +825,7 @@ def search_openlibrary(variants: list[str]) -> list[dict]:
 
 
 # --- OPSIYONEL KAYNAK 3: ISBNDB ---
-def search_isbndb(variants: list[str]) -> list[dict]:
+def search_isbndb(variants: list[str], deadline: float | None = None) -> list[dict]:
     api_key = get_secret("ISBNDB_API_KEY")
     if not api_key:
         return []
@@ -794,8 +833,12 @@ def search_isbndb(variants: list[str]) -> list[dict]:
     records = []
     headers = {"Authorization": api_key, "x-api-key": api_key}
     for isbn in variants:
+        if deadline_expired(deadline):
+            break
         for base_url in ("https://api2.isbndb.com/book/", "https://api.isbndb.com/book/"):
-            data = http_get_json(base_url + isbn, headers=headers)
+            if deadline_expired(deadline):
+                break
+            data = http_get_json(base_url + isbn, headers=headers, deadline=deadline)
             if not data:
                 continue
             book_data = data.get("book", data)
@@ -825,7 +868,7 @@ def search_isbndb(variants: list[str]) -> list[dict]:
     return records
 
 
-def search_isbnlib(variants: list[str]) -> list[dict]:
+def search_isbnlib(variants: list[str], deadline: float | None = None) -> list[dict]:
     """isbnlib ISBN doğrulama/metadata için ek kaynaktır; barkod görseli okumaz."""
     if isbnlib is None:
         return []
@@ -833,6 +876,8 @@ def search_isbnlib(variants: list[str]) -> list[dict]:
     records = []
     services = ("goob", "openl", "wiki")
     for isbn in variants:
+        if deadline_expired(deadline):
+            break
         try:
             canonical = isbnlib.canonical(isbn)
         except Exception:
@@ -841,6 +886,8 @@ def search_isbnlib(variants: list[str]) -> list[dict]:
             continue
 
         for service in services:
+            if deadline_expired(deadline):
+                break
             try:
                 data = isbnlib.meta(canonical, service=service)
             except Exception:
@@ -1332,13 +1379,21 @@ def candidate_product_links(soup: BeautifulSoup, base_url: str, variants: list[s
     return ordered
 
 
-def search_turkish_retailers(variants: list[str]) -> list[dict]:
+def search_turkish_retailers(
+    variants: list[str],
+    deadline: float | None = None,
+    link_limit: int = 10,
+) -> list[dict]:
     records = []
     for source, template in TURKISH_RETAILERS:
+        if deadline_expired(deadline):
+            break
         source_found = False
         for isbn in variants:
+            if deadline_expired(deadline):
+                break
             search_url = template.format(isbn=isbn)
-            final_url, html = http_get_html(search_url)
+            final_url, html = http_get_html(search_url, deadline=deadline)
             if not html:
                 continue
 
@@ -1349,8 +1404,10 @@ def search_turkish_retailers(variants: list[str]) -> list[dict]:
                 break
 
             soup = BeautifulSoup(html, "html.parser")
-            for link in candidate_product_links(soup, final_url, variants)[:10]:
-                product_url, product_html = http_get_html(link)
+            for link in candidate_product_links(soup, final_url, variants)[:link_limit]:
+                if deadline_expired(deadline):
+                    break
+                product_url, product_html = http_get_html(link, deadline=deadline)
                 if not product_html:
                     continue
                 record = extract_book_from_html(product_html, variants, source, product_url)
@@ -1363,11 +1420,15 @@ def search_turkish_retailers(variants: list[str]) -> list[dict]:
     return records
 
 
-def search_direct_isbn_pages(variants: list[str]) -> list[dict]:
+def search_direct_isbn_pages(variants: list[str], deadline: float | None = None) -> list[dict]:
     records = []
     for source, template in DIRECT_ISBN_PAGES:
+        if deadline_expired(deadline):
+            break
         for isbn in variants:
-            final_url, html = http_get_html(template.format(isbn=isbn))
+            if deadline_expired(deadline):
+                break
+            final_url, html = http_get_html(template.format(isbn=isbn), deadline=deadline)
             if not html:
                 continue
             record = extract_book_from_html(html, variants, source, final_url)
@@ -1416,7 +1477,11 @@ def should_skip_web_result(url: str) -> bool:
     return not parsed.scheme.startswith("http") or any(token in host_path for token in blocked)
 
 
-def search_web_for_isbn_pages(variants: list[str]) -> list[dict]:
+def search_web_for_isbn_pages(
+    variants: list[str],
+    deadline: float | None = None,
+    max_results: int = WEB_SEARCH_MAX_RESULTS,
+) -> list[dict]:
     """Son şans: ISBN'i web arama sonucu olarak bulup sayfaları tek tek doğrular."""
     records = []
     seen_links = set()
@@ -1424,7 +1489,9 @@ def search_web_for_isbn_pages(variants: list[str]) -> list[dict]:
     query = quote_plus(f'"{primary_isbn}" kitap ISBN')
     search_pages = []
     for template in WEB_SEARCH_TEMPLATES:
-        final_url, html = http_get_html(template.format(query=query))
+        if deadline_expired(deadline):
+            break
+        final_url, html = http_get_html(template.format(query=query), deadline=deadline)
         if html:
             search_pages.append((final_url, html))
 
@@ -1437,13 +1504,15 @@ def search_web_for_isbn_pages(variants: list[str]) -> list[dict]:
                 continue
             seen_links.add(link)
             links.append(link)
-            if len(links) >= WEB_SEARCH_MAX_RESULTS:
+            if len(links) >= max_results:
                 break
-        if len(links) >= WEB_SEARCH_MAX_RESULTS:
+        if len(links) >= max_results:
             break
 
     for link in links:
-        page_url, page_html = http_get_html(link)
+        if deadline_expired(deadline):
+            break
+        page_url, page_html = http_get_html(link, deadline=deadline)
         if not page_html:
             continue
         source = source_name_from_url(page_url)
@@ -1501,8 +1570,15 @@ def merge_records(normalized: dict, records: list[dict]) -> dict | None:
 
 
 @st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
-def get_book_info_comprehensive(raw_isbn: str, cache_version: int = LOOKUP_CACHE_VERSION) -> dict:
+def get_book_info_comprehensive(
+    raw_isbn: str,
+    cache_version: int = LOOKUP_CACHE_VERSION,
+    max_seconds: int | None = None,
+    web_result_limit: int = WEB_SEARCH_MAX_RESULTS,
+    retailer_link_limit: int = 10,
+) -> dict:
     _ = cache_version
+    deadline = time.monotonic() + max_seconds if max_seconds else None
     normalized = normalize_isbn(raw_isbn)
     if not normalized:
         return {
@@ -1515,19 +1591,26 @@ def get_book_info_comprehensive(raw_isbn: str, cache_version: int = LOOKUP_CACHE
 
     variants = normalized["variants"]
     records = []
-    records.extend(search_google_books(variants))
-    records.extend(search_openlibrary(variants))
-    records.extend(search_isbnlib(variants))
-    records.extend(search_isbndb(variants))
-    records.extend(search_direct_isbn_pages(variants))
+    records.extend(search_google_books(variants, deadline=deadline))
+    if not deadline_expired(deadline):
+        records.extend(search_openlibrary(variants, deadline=deadline))
+    if not deadline_expired(deadline) and max_seconds is None:
+        records.extend(search_isbnlib(variants, deadline=deadline))
+    if not deadline_expired(deadline):
+        records.extend(search_isbndb(variants, deadline=deadline))
+    if not deadline_expired(deadline):
+        records.extend(search_direct_isbn_pages(variants, deadline=deadline))
 
     merged = merge_records(normalized, records)
-    if not merged or merged["_score"] < 18 or not merged.get("publisher") or not merged.get("page_count"):
-        records.extend(search_turkish_retailers(variants))
+    if (
+        not deadline_expired(deadline)
+        and (not merged or merged["_score"] < 18 or not merged.get("publisher") or not merged.get("page_count"))
+    ):
+        records.extend(search_turkish_retailers(variants, deadline=deadline, link_limit=retailer_link_limit))
         merged = merge_records(normalized, records)
 
-    if not merged or merged["_score"] < 18 or not merged.get("title"):
-        records.extend(search_web_for_isbn_pages(variants))
+    if not deadline_expired(deadline) and (not merged or merged["_score"] < 18 or not merged.get("title")):
+        records.extend(search_web_for_isbn_pages(variants, deadline=deadline, max_results=web_result_limit))
         merged = merge_records(normalized, records)
 
     if merged:
@@ -1556,6 +1639,28 @@ def fetch_books() -> list[dict]:
     except Exception as exc:
         st.error(f"Kitaplar yüklenemedi: {exc}")
         return []
+
+
+def fetch_library_summary() -> dict:
+    summary = {"count": 0, "recent": []}
+    try:
+        count_response = supabase.table("books").select("id", count="exact").limit(1).execute()
+        summary["count"] = count_response.count or 0
+    except Exception:
+        summary["count"] = 0
+
+    try:
+        recent_response = (
+            supabase.table("books")
+            .select("title,author,created_at")
+            .order("created_at", desc=True)
+            .limit(2)
+            .execute()
+        )
+        summary["recent"] = recent_response.data or []
+    except Exception:
+        summary["recent"] = []
+    return summary
 
 
 def insert_book(data: dict) -> bool:
@@ -2261,7 +2366,12 @@ def bulk_row_to_book_data(row: dict, auto_lookup: bool) -> tuple[dict | None, bo
     data = blank_book(isbn)
 
     if auto_lookup and isbn:
-        lookup = get_book_info_comprehensive(isbn)
+        lookup = get_book_info_comprehensive(
+            isbn,
+            max_seconds=BULK_LOOKUP_TIMEOUT_SECONDS,
+            web_result_limit=4,
+            retailer_link_limit=4,
+        )
         if lookup.get("ok") and lookup.get("book"):
             data.update(lookup["book"])
             lookup_used = True
@@ -2317,7 +2427,13 @@ def process_bulk_barcode_images(image_files: list, save_unresolved: bool = True)
             result["duplicates"].append(isbn)
             continue
 
-        lookup = get_book_info_comprehensive(isbn, cache_version=LOOKUP_CACHE_VERSION + 1)
+        lookup = get_book_info_comprehensive(
+            isbn,
+            cache_version=LOOKUP_CACHE_VERSION + 1,
+            max_seconds=BULK_LOOKUP_TIMEOUT_SECONDS,
+            web_result_limit=4,
+            retailer_link_limit=4,
+        )
         if lookup.get("ok") and lookup.get("book", {}).get("title"):
             book_data = lookup["book"]
             book_data["isbn"] = isbn
@@ -2413,10 +2529,241 @@ def render_bulk_barcode_section():
                 st.write(f"- {isbn}")
 
 
+def parse_isbns_from_text(value: str) -> list[str]:
+    candidates = []
+    for chunk in re.split(r"[\s,;]+", str(value or "")):
+        normalized = normalize_isbn(chunk)
+        if normalized:
+            candidates.append(normalized["isbn13"] or normalized["variants"][0])
+    digits = only_digits(value)
+    candidates.extend(match.group(0) for match in re.finditer(r"97[89]\d{10}", digits))
+    return unique_keep_order([normalize_lookup_isbn(candidate) for candidate in candidates])
+
+
+def ensure_ultimate_barcode_state():
+    st.session_state.setdefault("ultimate_barcodes", [])
+    st.session_state.setdefault("ultimate_camera_nonce", 0)
+    st.session_state.setdefault("ultimate_lookup_result", None)
+
+
+def add_to_ultimate_barcodes(isbns: list[str]):
+    current = st.session_state.get("ultimate_barcodes", [])
+    st.session_state["ultimate_barcodes"] = unique_keep_order([*current, *isbns])
+
+
+def current_ultimate_barcodes_from_editor(editor_value) -> list[str]:
+    rows = editor_rows_to_list(editor_value)
+    isbns = []
+    for row in rows:
+        isbn = normalize_lookup_isbn(row.get("isbn"))
+        if isbn:
+            isbns.append(isbn)
+    return unique_keep_order(isbns)
+
+
+def render_ultimate_barcode_section():
+    ensure_ultimate_barcode_state()
+    with st.expander("Ultimate Barkod Listesi", expanded=False):
+        st.caption(
+            "Barkodları önce listeye topla. Liste 10 ile sınırlı değil; istersen 200-300 ISBN biriktirip sonra toplu aratabilirsin."
+        )
+
+        manual_text = st.text_area(
+            "ISBN listesini yapıştır",
+            placeholder="Her satıra veya aralara boşluk koyarak ISBN yazabilirsin.",
+            key="ultimate_manual_isbns",
+        )
+        uploaded_files = st.file_uploader(
+            "Barkod fotoğraflarını listeye eklemek için yükle",
+            type=["png", "jpg", "jpeg"],
+            accept_multiple_files=True,
+            key="ultimate_barcode_uploads",
+        )
+        camera_file = st.camera_input(
+            "Kamera ile bir barkod okut ve listeye ekle",
+            key=f"ultimate_barcode_camera_{st.session_state['ultimate_camera_nonce']}",
+        )
+
+        if st.button("Okunan / Yazılan Barkodları Listeye Ekle", use_container_width=True):
+            found_isbns = []
+            unreadable = []
+            found_isbns.extend(parse_isbns_from_text(manual_text))
+
+            for image_file in list(uploaded_files or []):
+                isbn = decode_isbn_from_image(image_file)
+                if isbn:
+                    found_isbns.append(normalize_lookup_isbn(isbn))
+                else:
+                    unreadable.append(getattr(image_file, "name", "Yüklenen görsel"))
+
+            if camera_file:
+                isbn = decode_isbn_from_image(camera_file)
+                if isbn:
+                    found_isbns.append(normalize_lookup_isbn(isbn))
+                    st.session_state["ultimate_camera_nonce"] += 1
+                else:
+                    unreadable.append("Kamera görüntüsü")
+
+            add_to_ultimate_barcodes(found_isbns)
+            st.session_state["ultimate_lookup_result"] = None
+            if found_isbns:
+                st.success(f"{len(unique_keep_order(found_isbns))} ISBN listeye eklendi.")
+            if unreadable:
+                st.warning("Okunamayan görseller: " + ", ".join(unreadable[:8]))
+
+        st.write(f"**Listedeki barkod sayısı:** {len(st.session_state['ultimate_barcodes'])}")
+        barcode_editor = st.data_editor(
+            [{"isbn": isbn} for isbn in st.session_state["ultimate_barcodes"]],
+            num_rows="dynamic",
+            use_container_width=True,
+            key="ultimate_barcode_editor",
+            column_config={"isbn": st.column_config.TextColumn("ISBN")},
+        )
+
+        list_col1, list_col2 = st.columns(2)
+        with list_col1:
+            if st.button("Listeyi Güncelle", use_container_width=True):
+                st.session_state["ultimate_barcodes"] = current_ultimate_barcodes_from_editor(barcode_editor)
+                st.success("Barkod listesi güncellendi.")
+        with list_col2:
+            if st.button("Listeyi Temizle", use_container_width=True):
+                st.session_state["ultimate_barcodes"] = []
+                st.session_state["ultimate_lookup_result"] = None
+                st.success("Barkod listesi temizlendi.")
+
+        save_unresolved = st.checkbox(
+            "Toplu aramada bulunamayan ISBN'leri Sonra Aranacaklar listesine kaydet",
+            value=True,
+            key="ultimate_save_unresolved",
+        )
+
+        if st.button("Listedeki Barkodları Toplu Arat", type="primary", use_container_width=True):
+            isbns = st.session_state.get("ultimate_barcodes", [])
+            if not isbns:
+                st.warning("Önce barkod listesine ISBN ekle.")
+                return
+
+            progress = st.progress(0)
+            status_box = st.empty()
+            result = {"found": [], "unresolved": [], "existing": [], "errors": []}
+
+            for index, isbn in enumerate(isbns, start=1):
+                progress.progress(index / len(isbns))
+                status_box.info(f"{index}/{len(isbns)} aranıyor: {isbn}")
+
+                if isbn_exists(isbn):
+                    result["existing"].append(isbn)
+                    continue
+
+                lookup = get_book_info_comprehensive(
+                    isbn,
+                    cache_version=LOOKUP_CACHE_VERSION + 1,
+                    max_seconds=BULK_LOOKUP_TIMEOUT_SECONDS,
+                    web_result_limit=4,
+                    retailer_link_limit=4,
+                )
+                if lookup.get("ok") and lookup.get("book", {}).get("title"):
+                    book = lookup["book"]
+                    book["isbn"] = isbn
+                    result["found"].append(book)
+                else:
+                    result["unresolved"].append(isbn)
+                    if save_unresolved:
+                        save_pending_isbn(isbn, note="Ultimate toplu barkod aramasında bulunamadı", source="ultimate_bulk")
+
+            status_box.success("Toplu arama tamamlandı.")
+            st.session_state["ultimate_lookup_result"] = result
+
+        result = st.session_state.get("ultimate_lookup_result")
+        if not result:
+            return
+
+        st.write(f"**Bulunan:** {len(result['found'])} · **Bulunamayan:** {len(result['unresolved'])} · **Zaten kayıtlı:** {len(result['existing'])}")
+
+        if result["found"]:
+            found_rows = []
+            for book in result["found"]:
+                found_rows.append(
+                    {
+                        "ekle": True,
+                        "isbn": clean_text(book.get("isbn")),
+                        "title": clean_text(book.get("title")),
+                        "author": clean_text(book.get("author")),
+                        "publisher": clean_text(book.get("publisher")),
+                        "first_print_year": clean_text(book.get("first_print_year")),
+                        "page_count": clean_text(book.get("page_count")),
+                        "reading_status": clean_text(book.get("reading_status")) or "Okunacak",
+                        "category": clean_text(book.get("category")) or "Kategorisiz",
+                    }
+                )
+
+            edited_found = st.data_editor(
+                found_rows,
+                use_container_width=True,
+                num_rows="fixed",
+                key="ultimate_found_editor",
+                column_config={
+                    "ekle": st.column_config.CheckboxColumn("Ekle"),
+                    "isbn": st.column_config.TextColumn("ISBN"),
+                    "title": st.column_config.TextColumn("Kitap Adı"),
+                    "author": st.column_config.TextColumn("Yazar"),
+                    "publisher": st.column_config.TextColumn("Yayınevi"),
+                    "first_print_year": st.column_config.TextColumn("Yıl"),
+                    "page_count": st.column_config.TextColumn("Sayfa"),
+                    "reading_status": st.column_config.SelectboxColumn("Okunma Durumu", options=READING_STATUS_OPTIONS),
+                    "category": st.column_config.SelectboxColumn("Kategori", options=CATEGORY_OPTIONS),
+                },
+            )
+
+            if st.button("Seçili Bulunanları Kütüphaneye Ekle", use_container_width=True):
+                rows = editor_rows_to_list(edited_found)
+                book_by_isbn = {clean_text(book.get("isbn")): book for book in result["found"]}
+                inserted = 0
+                skipped = 0
+                for row in rows:
+                    if not row.get("ekle"):
+                        continue
+                    isbn = clean_text(row.get("isbn"))
+                    book_data = dict(book_by_isbn.get(isbn, blank_book(isbn)))
+                    for field in (
+                        "isbn",
+                        "title",
+                        "author",
+                        "publisher",
+                        "first_print_year",
+                        "page_count",
+                        "reading_status",
+                        "category",
+                    ):
+                        book_data[field] = row.get(field)
+
+                    if isbn_exists(book_data.get("isbn")):
+                        skipped += 1
+                        continue
+                    if insert_book(book_data):
+                        inserted += 1
+
+                st.success(f"{inserted} kitap kütüphaneye eklendi.")
+                if skipped:
+                    st.warning(f"{skipped} kitap zaten kayıtlı olduğu için atlandı.")
+
+        if result["unresolved"]:
+            st.warning("Bulunamayan ISBN'ler:")
+            for isbn in result["unresolved"]:
+                st.markdown(f"- `{isbn}` · [Google'da ara]({google_search_url_for_isbn(isbn)})")
+
+        if result["existing"]:
+            st.info("Zaten kütüphanede olan ISBN'ler:")
+            for isbn in result["existing"]:
+                st.write(f"- {isbn}")
+
+
 def render_bulk_add_page():
     st.header("Toplu Kitap Ekle")
     st.caption("25 satırı tek seferde doldurup kaydedebilirsin. Boş satırlar yok sayılır.")
 
+    render_ultimate_barcode_section()
+    st.divider()
     render_bulk_barcode_section()
     st.divider()
 
@@ -2542,6 +2889,25 @@ def render_add_page():
     st.header("Yeni Kitap Ekle")
     add_nonce = st.session_state.get("add_nonce", 0)
 
+    success_message = st.session_state.pop("last_add_success", "")
+    if success_message:
+        st.success(success_message)
+
+    summary = fetch_library_summary()
+    metric_col, recent_col = st.columns([0.28, 0.72], vertical_alignment="center")
+    with metric_col:
+        st.metric("Kütüphanedeki kitap sayısı", summary["count"])
+    with recent_col:
+        recent_books = summary.get("recent") or []
+        if recent_books:
+            st.write("**Son eklenenler:**")
+            for book in recent_books:
+                author = clean_text(book.get("author"))
+                suffix = f" - {author}" if author else ""
+                st.write(f"• {clean_text(book.get('title'))}{suffix}")
+        else:
+            st.caption("Henüz kitap eklenmemiş.")
+
     camera_col, manual_col = st.columns([0.48, 0.52])
     with camera_col:
         img_file = st.camera_input(
@@ -2633,11 +2999,13 @@ def render_add_page():
 
     with st.form("save_book_form"):
         st.subheader("Kitap Detayları")
+        submit_top = st.form_submit_button("Kütüphaneye Kaydet", use_container_width=True)
         data = build_form_data(f"new_book_{add_nonce}", book_info)
         if target_isbn:
             normalized = normalize_isbn(target_isbn)
             data["isbn"] = normalized["isbn13"] if normalized else only_digits(target_isbn)
-        submitted = st.form_submit_button("Kütüphaneye Kaydet", use_container_width=True)
+        submit_bottom = st.form_submit_button("Kütüphaneye Kaydet", use_container_width=True)
+        submitted = submit_top or submit_bottom
 
     if submitted:
         if not clean_text(data.get("title")):
@@ -2650,7 +3018,7 @@ def render_add_page():
             return
 
         if insert_book(data):
-            st.success(f"'{clean_text(data['title'])}' kütüphaneye eklendi.")
+            st.session_state["last_add_success"] = f"'{clean_text(data['title'])}' kütüphaneye eklendi."
             set_page("add")
             st.session_state["add_nonce"] = add_nonce + 1
             st.rerun()
