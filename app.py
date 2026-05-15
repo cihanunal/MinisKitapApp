@@ -2999,12 +2999,20 @@ def render_add_page():
 
     with st.form("save_book_form"):
         st.subheader("Kitap Detayları")
-        submit_top = st.form_submit_button("Kütüphaneye Kaydet", use_container_width=True)
+        submit_top = st.form_submit_button(
+            "Kütüphaneye Kaydet",
+            use_container_width=True,
+            key=f"save_book_top_{add_nonce}",
+        )
         data = build_form_data(f"new_book_{add_nonce}", book_info)
         if target_isbn:
             normalized = normalize_isbn(target_isbn)
             data["isbn"] = normalized["isbn13"] if normalized else only_digits(target_isbn)
-        submit_bottom = st.form_submit_button("Kütüphaneye Kaydet", use_container_width=True)
+        submit_bottom = st.form_submit_button(
+            "Kütüphaneye Kaydet",
+            use_container_width=True,
+            key=f"save_book_bottom_{add_nonce}",
+        )
         submitted = submit_top or submit_bottom
 
     if submitted:
