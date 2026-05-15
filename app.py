@@ -30,7 +30,7 @@ except Exception:
 
 
 APP_DIR = Path(__file__).resolve().parent
-APP_NAME = "Badger's Book App"
+APP_NAME = "Badgers' Kitap App"
 BRAND_IMAGE_PATHS = [
     APP_DIR / "assets" / "badger.png",
     APP_DIR / "badger.png",
@@ -53,6 +53,8 @@ LOOKUP_CACHE_VERSION = 4
 PAGE_LABELS = {
     "library": "🏠 Kütüphanem",
     "add": "🔍 Kitap Ekle",
+    "bulk_add": "🧾 Toplu Kitap Ekle",
+    "lookup_queue": "⏳ Sonra Aranacaklar",
 }
 
 READING_STATUS_OPTIONS = [
@@ -144,6 +146,10 @@ DIRECT_ISBN_PAGES = [
 ]
 
 WEB_SEARCH_MAX_RESULTS = 8
+WEB_SEARCH_TEMPLATES = [
+    "https://duckduckgo.com/html/?q={query}",
+    "https://www.bing.com/search?q={query}",
+]
 
 
 def get_secret(name: str, default: str = "") -> str:
@@ -1415,19 +1421,24 @@ def search_web_for_isbn_pages(variants: list[str]) -> list[dict]:
     records = []
     seen_links = set()
     primary_isbn = variants[0]
-    search_url = f"https://duckduckgo.com/html/?q={quote_plus(f'\"{primary_isbn}\" kitap ISBN')}"
-    final_url, html = http_get_html(search_url)
-    if not html:
-        return records
+    query = quote_plus(f'"{primary_isbn}" kitap ISBN')
+    search_pages = []
+    for template in WEB_SEARCH_TEMPLATES:
+        final_url, html = http_get_html(template.format(query=query))
+        if html:
+            search_pages.append((final_url, html))
 
-    soup = BeautifulSoup(html, "html.parser")
     links = []
-    for anchor in soup.find_all("a", href=True):
-        link = unwrap_search_result_url(anchor["href"], final_url)
-        if should_skip_web_result(link) or link in seen_links:
-            continue
-        seen_links.add(link)
-        links.append(link)
+    for final_url, html in search_pages:
+        soup = BeautifulSoup(html, "html.parser")
+        for anchor in soup.find_all("a", href=True):
+            link = unwrap_search_result_url(anchor["href"], final_url)
+            if should_skip_web_result(link) or link in seen_links:
+                continue
+            seen_links.add(link)
+            links.append(link)
+            if len(links) >= WEB_SEARCH_MAX_RESULTS:
+                break
         if len(links) >= WEB_SEARCH_MAX_RESULTS:
             break
 
@@ -1592,6 +1603,72 @@ def isbn_exists(isbn: str) -> dict | None:
         return data[0] if data else None
     except Exception:
         return None
+
+
+def normalize_lookup_isbn(raw_isbn: str) -> str:
+    normalized = normalize_isbn(raw_isbn)
+    if normalized:
+        return normalized.get("isbn13") or normalized["variants"][0]
+    return only_digits(raw_isbn)
+
+
+def google_search_url_for_isbn(isbn: str) -> str:
+    isbn = normalize_lookup_isbn(isbn)
+    return f"https://www.google.com/search?q={quote_plus(f'{isbn} kitap ISBN')}"
+
+
+def save_pending_isbn(raw_isbn: str, note: str = "", source: str = "manual") -> bool:
+    isbn = normalize_lookup_isbn(raw_isbn)
+    if not isbn:
+        st.error("Kaydedilecek geçerli bir ISBN bulunamadı.")
+        return False
+    payload = {
+        "isbn": isbn,
+        "status": "bekliyor",
+        "source": clean_text(source),
+        "note": clean_text(note),
+    }
+    try:
+        supabase.table("isbn_lookup_queue").upsert(payload, on_conflict="isbn").execute()
+        return True
+    except Exception as exc:
+        st.error(
+            "ISBN'i sonra arama listesine kaydedemedim. "
+            "Supabase'te yeni kuyruk tablosu için migration SQL'ini çalıştırman gerekiyor."
+        )
+        st.caption(str(exc))
+        return False
+
+
+def fetch_pending_isbns() -> list[dict]:
+    try:
+        response = (
+            supabase.table("isbn_lookup_queue")
+            .select("*")
+            .order("created_at", desc=True)
+            .execute()
+        )
+        return response.data or []
+    except Exception:
+        return []
+
+
+def update_pending_isbn_status(queue_id, status: str) -> bool:
+    try:
+        supabase.table("isbn_lookup_queue").update({"status": status}).eq("id", queue_id).execute()
+        return True
+    except Exception as exc:
+        st.error(f"Kuyruk durumu güncellenemedi: {exc}")
+        return False
+
+
+def delete_pending_isbn(queue_id) -> bool:
+    try:
+        supabase.table("isbn_lookup_queue").delete().eq("id", queue_id).execute()
+        return True
+    except Exception as exc:
+        st.error(f"Kuyruk kaydı silinemedi: {exc}")
+        return False
 
 
 # --- FILTRE, SIRALAMA VE YEDEK ---
@@ -2140,6 +2217,166 @@ def render_book_editor(book: dict):
                 st.rerun()
 
 
+def blank_bulk_rows(count: int = 25) -> list[dict]:
+    return [
+        {
+            "isbn": "",
+            "title": "",
+            "author": "",
+            "publisher": "",
+            "first_print_year": "",
+            "page_count": "",
+            "reading_status": "Okunacak",
+            "category": "Kategorisiz",
+            "tags": "",
+            "notes": "",
+        }
+        for _ in range(count)
+    ]
+
+
+def editor_rows_to_list(editor_value) -> list[dict]:
+    if editor_value is None:
+        return []
+    if hasattr(editor_value, "to_dict"):
+        return editor_value.to_dict("records")
+    return list(editor_value)
+
+
+def row_has_any_book_data(row: dict) -> bool:
+    return any(clean_text(row.get(key)) for key in ("isbn", "title", "author", "publisher", "notes", "tags"))
+
+
+def bulk_row_to_book_data(row: dict, auto_lookup: bool) -> tuple[dict | None, bool]:
+    row = {key: clean_text(value) for key, value in row.items()}
+    isbn = normalize_lookup_isbn(row.get("isbn"))
+    lookup_used = False
+    data = blank_book(isbn)
+
+    if auto_lookup and isbn:
+        lookup = get_book_info_comprehensive(isbn)
+        if lookup.get("ok") and lookup.get("book"):
+            data.update(lookup["book"])
+            lookup_used = True
+
+    manual_values = {
+        "isbn": isbn,
+        "title": row.get("title"),
+        "author": row.get("author"),
+        "publisher": row.get("publisher"),
+        "first_print_year": row.get("first_print_year"),
+        "page_count": row.get("page_count"),
+        "reading_status": row.get("reading_status") or "Okunacak",
+        "category": row.get("category") or "Kategorisiz",
+        "tags": parse_tags(row.get("tags")),
+        "notes": row.get("notes"),
+    }
+
+    for key, value in manual_values.items():
+        if value not in ("", [], None):
+            data[key] = value
+
+    if not clean_text(data.get("title")):
+        return None, lookup_used
+    return data, lookup_used
+
+
+def render_bulk_add_page():
+    st.header("Toplu Kitap Ekle")
+    st.caption("25 satırı tek seferde doldurup kaydedebilirsin. Boş satırlar yok sayılır.")
+
+    auto_lookup = st.checkbox(
+        "ISBN yazdığım satırlarda boş bilgileri internetten doldurmayı dene",
+        value=True,
+    )
+    save_unresolved = st.checkbox(
+        "Başlığı bulunamayan ISBN'leri sonra aranacaklar listesine ekle",
+        value=True,
+    )
+
+    initial_rows = blank_bulk_rows(25)
+    if st.session_state.get("bulk_prefill_isbn"):
+        initial_rows[0]["isbn"] = st.session_state.pop("bulk_prefill_isbn")
+
+    rows = st.data_editor(
+        initial_rows,
+        num_rows="fixed",
+        use_container_width=True,
+        hide_index=False,
+        key="bulk_books_editor",
+        column_config={
+            "isbn": st.column_config.TextColumn("ISBN"),
+            "title": st.column_config.TextColumn("Kitap Adı"),
+            "author": st.column_config.TextColumn("Yazar"),
+            "publisher": st.column_config.TextColumn("Yayınevi"),
+            "first_print_year": st.column_config.TextColumn("Yıl"),
+            "page_count": st.column_config.TextColumn("Sayfa"),
+            "reading_status": st.column_config.SelectboxColumn(
+                "Okunma Durumu",
+                options=READING_STATUS_OPTIONS,
+                default="Okunacak",
+            ),
+            "category": st.column_config.SelectboxColumn(
+                "Kategori",
+                options=CATEGORY_OPTIONS,
+                default="Kategorisiz",
+            ),
+            "tags": st.column_config.TextColumn("Etiketler"),
+            "notes": st.column_config.TextColumn("Not"),
+        },
+    )
+
+    if not st.button("Toplu Kaydet", type="primary", use_container_width=True):
+        return
+
+    inserted = 0
+    skipped = 0
+    queued = 0
+    duplicates = 0
+    errors = 0
+    seen_isbns = set()
+
+    with st.spinner("Toplu kayıt işleniyor..."):
+        for row_number, row in enumerate(editor_rows_to_list(rows), start=1):
+            if not row_has_any_book_data(row):
+                continue
+
+            raw_isbn = clean_text(row.get("isbn"))
+            isbn = normalize_lookup_isbn(raw_isbn)
+            if isbn and isbn in seen_isbns:
+                duplicates += 1
+                continue
+            if isbn:
+                seen_isbns.add(isbn)
+
+            data, _ = bulk_row_to_book_data(row, auto_lookup=auto_lookup)
+            if not data:
+                skipped += 1
+                if save_unresolved and isbn:
+                    if save_pending_isbn(isbn, note=f"Toplu ekleme satırı {row_number}", source="bulk_add"):
+                        queued += 1
+                continue
+
+            if data.get("isbn") and isbn_exists(data["isbn"]):
+                duplicates += 1
+                continue
+
+            if insert_book(data):
+                inserted += 1
+            else:
+                errors += 1
+
+    st.success(f"{inserted} kitap eklendi.")
+    if queued:
+        st.info(f"{queued} ISBN sonra aranacaklar listesine kaydedildi.")
+    if skipped:
+        st.warning(f"{skipped} satırda kitap adı bulunamadığı için doğrudan eklenmedi.")
+    if duplicates:
+        st.warning(f"{duplicates} satır tekrar/önceden kayıtlı olduğu için atlandı.")
+    if errors:
+        st.error(f"{errors} satır kaydedilemedi.")
+
+
 def render_library_page(all_books: list[dict], filters: tuple):
     personal_filter, status_filter, tag_filter, search_term, sort_by = filters
     st.header("Kitaplığım")
@@ -2203,6 +2440,23 @@ def render_add_page():
     lookup = None
     book_info = None
     if target_isbn:
+        normalized_target = normalize_isbn(target_isbn)
+        isbn_for_later = normalized_target["isbn13"] if normalized_target else only_digits(target_isbn)
+        later_col, search_col = st.columns([0.42, 0.58])
+        with later_col:
+            if st.button("Bu barkodu sonra aramak için kaydet", use_container_width=True):
+                if save_pending_isbn(isbn_for_later, source="single_add"):
+                    st.success(f"{isbn_for_later} sonra aranacaklar listesine kaydedildi.")
+                    return
+        with search_col:
+            skip_lookup = st.checkbox("Şimdilik internette arama, sadece barkodu kaydetmek istiyorum", value=False)
+
+        if skip_lookup:
+            if st.button("Barkodu listeye kaydet ve çık", type="primary", use_container_width=True):
+                if save_pending_isbn(isbn_for_later, source="single_add_skip_lookup"):
+                    st.success(f"{isbn_for_later} sonra aranacaklar listesine kaydedildi.")
+            return
+
         with st.spinner("Kitap aranıyor: Google Books, Open Library, ISBNdb ve Türkçe kaynaklar..."):
             lookup = get_book_info_comprehensive(target_isbn)
         normalized = lookup.get("normalized")
@@ -2220,6 +2474,10 @@ def render_add_page():
                 "Online kaynaklarda güvenilir kayıt bulunamadı. "
                 "ISBN hazır; bilgileri elle girip kaydedebilirsin."
             )
+            st.markdown(f"[Bu ISBN'i Google'da ara]({google_search_url_for_isbn(target_isbn)})")
+            if st.button("Bulunamadı, sonra aranacaklar listesine kaydet", use_container_width=True):
+                if save_pending_isbn(target_isbn, note="Tekil ekleme ekranında bulunamadı", source="lookup_failed"):
+                    st.success("ISBN sonra aranacaklar listesine kaydedildi.")
 
     if manual_without_isbn and not book_info:
         book_info = blank_book("")
@@ -2254,6 +2512,69 @@ def render_add_page():
             st.rerun()
 
 
+def render_lookup_queue_page():
+    st.header("Sonra Aranacak Barkodlar")
+    st.caption("Bulunması uzun süren veya o anda eklemek istemediğin ISBN'leri burada saklayıp sonra tekrar aratabilirsin.")
+
+    pending_items = fetch_pending_isbns()
+    if not pending_items:
+        st.info("Sonra aranacak ISBN yok.")
+        return
+
+    for item in pending_items:
+        queue_id = item.get("id")
+        isbn = clean_text(item.get("isbn"))
+        status = clean_text(item.get("status")) or "bekliyor"
+        note = clean_text(item.get("note"))
+
+        with st.expander(f"{isbn} · {status}"):
+            st.write(f"**ISBN:** {isbn}")
+            if note:
+                st.write(f"**Not:** {note}")
+            st.markdown(f"[Google'da ara]({google_search_url_for_isbn(isbn)})")
+
+            action_col1, action_col2, action_col3 = st.columns(3)
+            with action_col1:
+                if st.button("Uygulamada Tekrar Ara", key=f"queue_search_{queue_id}", use_container_width=True):
+                    with st.spinner(f"{isbn} yeniden aranıyor..."):
+                        lookup = get_book_info_comprehensive(isbn, cache_version=LOOKUP_CACHE_VERSION + 1)
+                    if lookup.get("ok") and lookup.get("book", {}).get("title"):
+                        st.session_state[f"queue_result_{queue_id}"] = lookup["book"]
+                        update_pending_isbn_status(queue_id, "bulundu")
+                        st.success("Kitap bulundu. Aşağıdan kontrol edip ekleyebilirsin.")
+                    else:
+                        update_pending_isbn_status(queue_id, "bulunamadı")
+                        st.warning("Uygulama güvenilir kayıt bulamadı. Google linkinden kontrol edip elle ekleyebilirsin.")
+            with action_col2:
+                if st.button("Elle Eklemeye Gönder", key=f"queue_manual_{queue_id}", use_container_width=True):
+                    st.session_state["bulk_prefill_isbn"] = isbn
+                    set_page("bulk_add")
+                    st.rerun()
+            with action_col3:
+                if st.button("Listeden Sil", key=f"queue_delete_{queue_id}", use_container_width=True):
+                    if delete_pending_isbn(queue_id):
+                        st.success("ISBN listeden silindi.")
+                        st.rerun()
+
+            result = st.session_state.get(f"queue_result_{queue_id}")
+            if result:
+                if result.get("cover_url"):
+                    st.image(result["cover_url"], width=120)
+                with st.form(f"queue_add_form_{queue_id}"):
+                    data = build_form_data(f"queue_{queue_id}", result)
+                    data["isbn"] = normalize_lookup_isbn(isbn)
+                    submitted = st.form_submit_button("Bu Kitabı Kütüphaneye Ekle", use_container_width=True)
+
+                if submitted:
+                    if isbn_exists(data.get("isbn")):
+                        st.warning("Bu ISBN zaten kütüphanede kayıtlı.")
+                    elif insert_book(data):
+                        update_pending_isbn_status(queue_id, "eklendi")
+                        delete_pending_isbn(queue_id)
+                        st.success("Kitap kütüphaneye eklendi ve kuyruktan kaldırıldı.")
+                        st.rerun()
+
+
 # --- UYGULAMA ---
 inject_css()
 
@@ -2266,5 +2587,9 @@ render_top_bar()
 
 if st.session_state.get("page") == "add":
     render_add_page()
+elif st.session_state.get("page") == "bulk_add":
+    render_bulk_add_page()
+elif st.session_state.get("page") == "lookup_queue":
+    render_lookup_queue_page()
 else:
     render_library_page(all_books, filters)
