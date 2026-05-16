@@ -50,7 +50,7 @@ HTTP_HEADERS = {
 }
 
 REQUEST_TIMEOUT = 8
-LOOKUP_CACHE_VERSION = 4
+LOOKUP_CACHE_VERSION = 5
 BULK_LOOKUP_TIMEOUT_SECONDS = 20
 
 PAGE_LABELS = {
@@ -157,6 +157,11 @@ TURKISH_RETAILERS = [
     ("İmge", "https://www.imge.com.tr/arama?q={isbn}"),
     ("Amazon TR", "https://www.amazon.com.tr/s?k={isbn}"),
 ]
+
+SITE_SPECIFIC_RETAILERS = {
+    "kitapsec": ("Kitapseç", "https://www.kitapsec.com/Arama/index.php?key={isbn}"),
+    "kitapyurdu": ("Kitapyurdu", "https://www.kitapyurdu.com/index.php?route=product/search&filter_name={isbn}"),
+}
 
 DIRECT_ISBN_PAGES = [
     ("Ucuzkitapal", "https://www.ucuzkitapal.com/{isbn}/"),
@@ -1050,6 +1055,87 @@ def person_or_org_to_text(value) -> str:
     return clean_text(value)
 
 
+def strip_publisher_from_title(title: str, publisher: str) -> str:
+    title = clean_text(title)
+    publisher = clean_text(publisher)
+    if not title or not publisher:
+        return title
+
+    for suffix in unique_keep_order([publisher, normalize_publisher_name(publisher)]):
+        suffix = clean_text(suffix)
+        if suffix and title.casefold().endswith(suffix.casefold()):
+            stripped = clean_text(title[: -len(suffix)])
+            return stripped or title
+
+        title_words = title.split()
+        suffix_words = suffix.split()
+        if suffix_words and len(title_words) > len(suffix_words):
+            trailing = " ".join(title_words[-len(suffix_words) :])
+            if canonical_key(trailing) == canonical_key(suffix):
+                stripped = " ".join(title_words[: -len(suffix_words)])
+                return clean_text(stripped) or title
+
+    return title
+
+
+def schema_value_to_text(value) -> str:
+    if isinstance(value, dict):
+        return clean_text(
+            value.get("unitText")
+            or value.get("value")
+            or value.get("description")
+            or value.get("name")
+            or value.get("@id")
+        )
+    return clean_text(value)
+
+
+def schema_additional_properties(obj: dict) -> dict:
+    mapped = {}
+    properties = obj.get("additionalProperty") or obj.get("additionalProperties") or []
+    if isinstance(properties, dict):
+        properties = [properties]
+    if not isinstance(properties, list):
+        return mapped
+
+    for prop in properties:
+        if not isinstance(prop, dict):
+            continue
+        name = canonical_key(prop.get("name"))
+        value = schema_value_to_text(
+            prop.get("unitText")
+            or prop.get("value")
+            or prop.get("description")
+            or prop.get("text")
+        )
+        if not name or not value or is_noise_text(value):
+            continue
+
+        if "yazar" in name or name == "author":
+            mapped["author"] = dedupe_comma_values(value)
+        elif "cevirmen" in name or "translator" in name:
+            mapped["translator"] = dedupe_comma_values(value)
+        elif "yayinevi" in name or "yayinci" in name or name in {"publisher", "marka", "brand"}:
+            mapped["publisher"] = normalize_publisher_name(value)
+        elif "sayfa" in name or name == "pages":
+            mapped["page_count"] = clean_text(only_digits(value) or value)
+        elif "ebat" in name or "boyut" in name or "dimension" in name:
+            mapped["dimensions"] = value
+        elif "kategori" in name or name in {"tur", "konu", "genre", "category"}:
+            mapped["genre"] = value
+        elif "hamur" in name or "kagit" in name or "cilt" in name:
+            mapped["paper_type"] = value
+        elif "baski sayisi" in name or name == "baski":
+            mapped["print_edition"] = value
+        elif "basim tarihi" in name or "yayin tarihi" in name or "ilk baski yili" in name:
+            mapped["first_print_year"] = first_year(value)
+            mapped["published_date"] = value
+        elif name in {"dil", "yayin dili", "kitap dili"}:
+            mapped["language"] = pretty_language(value)
+
+    return mapped
+
+
 def record_from_jsonld(obj: dict, variants: list[str], source: str, url: str) -> dict | None:
     type_value = obj.get("@type", "")
     type_text = " ".join(type_value) if isinstance(type_value, list) else str(type_value)
@@ -1063,7 +1149,15 @@ def record_from_jsonld(obj: dict, variants: list[str], source: str, url: str) ->
     if has_isbn_field and not isbn_matched:
         return None
 
-    title = clean_text(obj.get("name") or obj.get("headline"))
+    schema_props = schema_additional_properties(obj)
+    author = person_or_org_to_text(obj.get("author"))
+    publisher = (
+        person_or_org_to_text(obj.get("publisher"))
+        or person_or_org_to_text(obj.get("brand"))
+        or schema_props.get("publisher", "")
+    )
+
+    title = strip_publisher_from_title(obj.get("name") or obj.get("headline"), publisher)
     if not title or is_bad_title(title, variants, source):
         return None
 
@@ -1078,8 +1172,8 @@ def record_from_jsonld(obj: dict, variants: list[str], source: str, url: str) ->
     book.update(
         {
             "title": title,
-            "author": person_or_org_to_text(obj.get("author") or obj.get("brand")),
-            "publisher": normalize_publisher_name(person_or_org_to_text(obj.get("publisher"))),
+            "author": dedupe_comma_values(author),
+            "publisher": normalize_publisher_name(publisher),
             "description": clean_text(obj.get("description")),
             "cover_url": image_to_url(obj.get("image")),
             "source_url": url,
@@ -1090,6 +1184,10 @@ def record_from_jsonld(obj: dict, variants: list[str], source: str, url: str) ->
             "_isbn_matched": isbn_matched,
         }
     )
+    for field, value in schema_props.items():
+        if value and (not book.get(field) or field in {"author", "publisher", "page_count", "genre"}):
+            book[field] = value
+    book["title"] = strip_publisher_from_title(book.get("title"), book.get("publisher"))
     return sanitize_scraped_record(book, variants, source)
 
 
@@ -1477,6 +1575,46 @@ def candidate_product_links(soup: BeautifulSoup, base_url: str, variants: list[s
     return ordered
 
 
+def search_specific_retailer(
+    variants: list[str],
+    source: str,
+    template: str,
+    deadline: float | None = None,
+    link_limit: int = 12,
+) -> list[dict]:
+    records = []
+    seen_links = set()
+
+    for isbn in variants:
+        if deadline_expired(deadline):
+            break
+        search_url = template.format(isbn=isbn)
+        final_url, html = http_get_html(search_url, deadline=deadline)
+        if not html:
+            continue
+
+        record = extract_book_from_html(html, variants, source, final_url)
+        if record:
+            records.append(record)
+            break
+
+        soup = BeautifulSoup(html, "html.parser")
+        for link in candidate_product_links(soup, final_url, variants)[:link_limit]:
+            if deadline_expired(deadline):
+                break
+            if link in seen_links:
+                continue
+            seen_links.add(link)
+            product_url, product_html = http_get_html(link, deadline=deadline)
+            if not product_html:
+                continue
+            record = extract_book_from_html(product_html, variants, source, product_url)
+            if record:
+                records.append(record)
+                return records
+    return records
+
+
 def search_turkish_retailers(
     variants: list[str],
     deadline: float | None = None,
@@ -1486,36 +1624,108 @@ def search_turkish_retailers(
     for source, template in TURKISH_RETAILERS:
         if deadline_expired(deadline):
             break
-        source_found = False
-        for isbn in variants:
-            if deadline_expired(deadline):
-                break
-            search_url = template.format(isbn=isbn)
-            final_url, html = http_get_html(search_url, deadline=deadline)
-            if not html:
-                continue
-
-            record = extract_book_from_html(html, variants, source, final_url)
-            if record:
-                records.append(record)
-                source_found = True
-                break
-
-            soup = BeautifulSoup(html, "html.parser")
-            for link in candidate_product_links(soup, final_url, variants)[:link_limit]:
-                if deadline_expired(deadline):
-                    break
-                product_url, product_html = http_get_html(link, deadline=deadline)
-                if not product_html:
-                    continue
-                record = extract_book_from_html(product_html, variants, source, product_url)
-                if record:
-                    records.append(record)
-                    source_found = True
-                    break
-            if source_found:
-                break
+        records.extend(search_specific_retailer(variants, source, template, deadline=deadline, link_limit=link_limit))
     return records
+
+
+def lookup_specific_retailer(
+    raw_isbn: str,
+    retailer_key: str,
+    max_seconds: int = 20,
+    link_limit: int = 12,
+) -> dict:
+    normalized = normalize_isbn(raw_isbn)
+    if not normalized:
+        return {
+            "ok": False,
+            "error": "Geçerli bir ISBN bulunamadı.",
+            "normalized": None,
+            "book": blank_book(only_digits(raw_isbn)),
+            "records_count": 0,
+        }
+
+    config = SITE_SPECIFIC_RETAILERS.get(retailer_key)
+    if not config:
+        return {
+            "ok": False,
+            "error": "Bilinmeyen kitap sitesi.",
+            "normalized": normalized,
+            "book": blank_book(normalized.get("isbn13") or normalized["variants"][0]),
+            "records_count": 0,
+        }
+
+    deadline = time.monotonic() + max_seconds if max_seconds else None
+    source, template = config
+    records = search_specific_retailer(
+        normalized["variants"],
+        source,
+        template,
+        deadline=deadline,
+        link_limit=link_limit,
+    )
+    merged = merge_records(normalized, records)
+    if merged:
+        return {
+            "ok": True,
+            "error": "",
+            "normalized": normalized,
+            "book": merged,
+            "records_count": len(records),
+        }
+    return {
+        "ok": False,
+        "error": f"{source} üzerinde güvenilir kayıt bulunamadı.",
+        "normalized": normalized,
+        "book": blank_book(normalized.get("isbn13") or normalized["variants"][0]),
+        "records_count": len(records),
+    }
+
+
+def lookup_retailer_priority(raw_isbn: str, max_seconds: int = 30, link_limit: int = 12) -> dict:
+    normalized = normalize_isbn(raw_isbn)
+    if not normalized:
+        return {
+            "ok": False,
+            "error": "Geçerli bir ISBN bulunamadı.",
+            "normalized": None,
+            "book": blank_book(only_digits(raw_isbn)),
+            "records_count": 0,
+        }
+
+    deadline = time.monotonic() + max_seconds if max_seconds else None
+    records = []
+    for source, template in SITE_SPECIFIC_RETAILERS.values():
+        if deadline_expired(deadline):
+            break
+        records.extend(
+            search_specific_retailer(
+                normalized["variants"],
+                source,
+                template,
+                deadline=deadline,
+                link_limit=link_limit,
+            )
+        )
+        merged = merge_records(normalized, records)
+        if merged and merged.get("title") and merged.get("author") and merged.get("publisher"):
+            break
+
+    merged = merge_records(normalized, records)
+    if merged:
+        return {
+            "ok": True,
+            "error": "",
+            "normalized": normalized,
+            "book": merged,
+            "records_count": len(records),
+        }
+    return {
+        "ok": False,
+        "error": "Kitapseç ve Kitapyurdu üzerinde güvenilir kayıt bulunamadı.",
+        "normalized": normalized,
+        "book": blank_book(normalized.get("isbn13") or normalized["variants"][0]),
+        "records_count": len(records),
+    }
 
 
 def search_direct_isbn_pages(variants: list[str], deadline: float | None = None) -> list[dict]:
@@ -3723,8 +3933,10 @@ def render_lookup_queue_page():
         st.info("Sonra aranacak ISBN yok.")
         return
 
-    if st.button("Tüm Bekleyenleri Kitap Sitelerinde Güçlü Ara", type="primary", use_container_width=True):
-        searchable = [item for item in pending_items if clean_text(item.get("status")) in {"bekliyor", "bulunamadı", ""}]
+    searchable_statuses = {"bekliyor", "bulunamadı", ""}
+
+    def run_pending_batch(mode: str):
+        searchable = [item for item in pending_items if clean_text(item.get("status")) in searchable_statuses]
         if not searchable:
             st.info("Aranacak bekleyen ISBN yok.")
             return
@@ -3733,21 +3945,37 @@ def render_lookup_queue_page():
         for index, item in enumerate(searchable, start=1):
             isbn = clean_text(item.get("isbn"))
             progress.progress(index / len(searchable))
-            lookup = get_book_info_comprehensive(
-                isbn,
-                cache_version=LOOKUP_CACHE_VERSION + 2,
-                max_seconds=25,
-                web_result_limit=6,
-                retailer_link_limit=8,
-            )
+            if mode in SITE_SPECIFIC_RETAILERS:
+                lookup = lookup_specific_retailer(isbn, mode, max_seconds=20, link_limit=12)
+            else:
+                lookup = lookup_retailer_priority(isbn, max_seconds=20, link_limit=12)
+                if not lookup.get("ok"):
+                    lookup = get_book_info_comprehensive(
+                        isbn,
+                        cache_version=LOOKUP_CACHE_VERSION + 2,
+                        max_seconds=20,
+                        web_result_limit=4,
+                        retailer_link_limit=6,
+                    )
             if lookup.get("ok") and lookup.get("book", {}).get("title"):
                 st.session_state[f"queue_result_{item.get('id')}"] = lookup["book"]
                 update_pending_isbn_status(item.get("id"), "bulundu")
                 found += 1
             else:
                 update_pending_isbn_status(item.get("id"), "bulunamadı")
-        st.success(f"Güçlü arama tamamlandı. {found} kitap için bilgi bulundu.")
+        st.success(f"Arama tamamlandı. {found} kitap için bilgi bulundu.")
         st.rerun()
+
+    bulk_col1, bulk_col2, bulk_col3 = st.columns(3)
+    with bulk_col1:
+        if st.button("Tüm Bekleyenleri Kitapseç'te Ara", type="primary", use_container_width=True):
+            run_pending_batch("kitapsec")
+    with bulk_col2:
+        if st.button("Tüm Bekleyenleri Kitapyurdu'nda Ara", use_container_width=True):
+            run_pending_batch("kitapyurdu")
+    with bulk_col3:
+        if st.button("Tüm Bekleyenleri Kitap Sitelerinde Güçlü Ara", use_container_width=True):
+            run_pending_batch("all")
 
     for item in pending_items:
         queue_id = item.get("id")
@@ -3759,10 +3987,31 @@ def render_lookup_queue_page():
             st.write(f"**ISBN:** {isbn}")
             if note:
                 st.write(f"**Not:** {note}")
-            st.markdown(f"[Google'da ara]({google_search_url_for_isbn(isbn)})")
 
-            action_col1, action_col2, action_col3 = st.columns(3)
+            action_col1, action_col2, action_col3, action_col4, action_col5 = st.columns(5)
             with action_col1:
+                if st.button("Kitapseç'te Ara", key=f"queue_kitapsec_{queue_id}", use_container_width=True):
+                    with st.spinner(f"{isbn} Kitapseç'te aranıyor..."):
+                        lookup = lookup_specific_retailer(isbn, "kitapsec", max_seconds=20, link_limit=12)
+                    if lookup.get("ok") and lookup.get("book", {}).get("title"):
+                        st.session_state[f"queue_result_{queue_id}"] = lookup["book"]
+                        update_pending_isbn_status(queue_id, "bulundu")
+                        st.success("Kitapseç kaydı bulundu. Aşağıdan kontrol edip ekleyebilirsin.")
+                    else:
+                        update_pending_isbn_status(queue_id, "bulunamadı")
+                        st.warning("Kitapseç üzerinde güvenilir kayıt bulunamadı.")
+            with action_col2:
+                if st.button("Kitapyurdu'nda Ara", key=f"queue_kitapyurdu_{queue_id}", use_container_width=True):
+                    with st.spinner(f"{isbn} Kitapyurdu'nda aranıyor..."):
+                        lookup = lookup_specific_retailer(isbn, "kitapyurdu", max_seconds=20, link_limit=12)
+                    if lookup.get("ok") and lookup.get("book", {}).get("title"):
+                        st.session_state[f"queue_result_{queue_id}"] = lookup["book"]
+                        update_pending_isbn_status(queue_id, "bulundu")
+                        st.success("Kitapyurdu kaydı bulundu. Aşağıdan kontrol edip ekleyebilirsin.")
+                    else:
+                        update_pending_isbn_status(queue_id, "bulunamadı")
+                        st.warning("Kitapyurdu üzerinde güvenilir kayıt bulunamadı.")
+            with action_col3:
                 if st.button("Uygulamada Tekrar Ara", key=f"queue_search_{queue_id}", use_container_width=True):
                     with st.spinner(f"{isbn} yeniden aranıyor..."):
                         lookup = get_book_info_comprehensive(isbn, cache_version=LOOKUP_CACHE_VERSION + 1)
@@ -3772,13 +4021,13 @@ def render_lookup_queue_page():
                         st.success("Kitap bulundu. Aşağıdan kontrol edip ekleyebilirsin.")
                     else:
                         update_pending_isbn_status(queue_id, "bulunamadı")
-                        st.warning("Uygulama güvenilir kayıt bulamadı. Google linkinden kontrol edip elle ekleyebilirsin.")
-            with action_col2:
+                        st.warning("Uygulama güvenilir kayıt bulamadı. İstersen elle eklemeye gönderebilirsin.")
+            with action_col4:
                 if st.button("Elle Eklemeye Gönder", key=f"queue_manual_{queue_id}", use_container_width=True):
                     st.session_state["bulk_prefill_isbn"] = isbn
                     set_page("bulk_add")
                     st.rerun()
-            with action_col3:
+            with action_col5:
                 if st.button("Listeden Sil", key=f"queue_delete_{queue_id}", use_container_width=True):
                     if delete_pending_isbn(queue_id):
                         st.success("ISBN listeden silindi.")
