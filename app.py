@@ -583,6 +583,7 @@ def resolve_static_cover_path(value: str) -> str:
     return str(path) if path.exists() else value
 
 
+@st.cache_data(ttl=60 * 60, show_spinner=False)
 def load_static_library_books() -> list[dict]:
     if STATIC_LIBRARY_JSON.exists():
         try:
@@ -651,7 +652,10 @@ def static_library_status_text() -> str:
     if not books:
         return "GitHub hizli cache aktif degil."
     source = "klasor" if STATIC_LIBRARY_JSON.exists() else "ZIP"
-    return f"GitHub hizli cache aktif ({source}): {len(books)} kitap yerel dosyadan okunuyor."
+    return (
+        f"GitHub hizli cache aktif ({source}): {len(books)} kitap/kapak yerelden okunuyor; "
+        "okunma durumu, not ve puan gibi degisen alanlar Supabase'den canli bindiriliyor."
+    )
 
 
 def find_static_book_by_isbn(isbn: str) -> dict | None:
@@ -2254,17 +2258,96 @@ def fetch_books_from_supabase() -> list[dict]:
         st.error(f"Kitaplar yüklenemedi: {exc}")
         return []
 
+
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_live_books_overlay() -> list[dict]:
+    """Statik paketin üstüne güncel Supabase alanlarını bindirmek için hafif canlı katman."""
+    page_size = 1000
+    start = 0
+    rows = []
+    try:
+        while True:
+            response = (
+                supabase.table("books")
+                .select("*")
+                .range(start, start + page_size - 1)
+                .execute()
+            )
+            batch = response.data or []
+            rows.extend(batch)
+            if len(batch) < page_size:
+                break
+            start += page_size
+    except Exception:
+        return []
+    return rows
+
+
+def merge_static_books_with_live_overlay(static_books: list[dict]) -> list[dict]:
+    live_rows = fetch_live_books_overlay()
+    if not live_rows:
+        return static_books
+
+    live_by_id = {clean_text(row.get("id")): row for row in live_rows if clean_text(row.get("id"))}
+    live_by_isbn = {only_digits(row.get("isbn")): row for row in live_rows if only_digits(row.get("isbn"))}
+    used_live_ids = set()
+    merged = []
+
+    for static_book in static_books:
+        item = dict(static_book)
+        static_cover_url = clean_text(item.get("cover_url"))
+        static_local_cover = clean_text(item.get("local_cover_path"))
+        static_remote_cover = clean_text(item.get("remote_cover_url"))
+
+        live = live_by_id.get(clean_text(item.get("id"))) or live_by_isbn.get(only_digits(item.get("isbn")))
+        if live:
+            item.update(live)
+            live_id = clean_text(live.get("id"))
+            if live_id:
+                used_live_ids.add(live_id)
+
+            # Kapak statik pakette yerelse onu koruruz; canlı alanlar eski statik bilgileri ezebilir.
+            if static_cover_url and not static_cover_url.startswith(("http://", "https://", "data:")):
+                item["cover_url"] = static_cover_url
+                if static_local_cover:
+                    item["local_cover_path"] = static_local_cover
+                item["remote_cover_url"] = static_remote_cover or clean_text(live.get("cover_url"))
+            elif static_local_cover:
+                item["local_cover_path"] = static_local_cover
+
+        merged.append(item)
+
+    static_keys = {
+        clean_text(book.get("id")) or only_digits(book.get("isbn"))
+        for book in static_books
+        if clean_text(book.get("id")) or only_digits(book.get("isbn"))
+    }
+    for live in live_rows:
+        live_key = clean_text(live.get("id")) or only_digits(live.get("isbn"))
+        if live_key and live_key not in static_keys and clean_text(live.get("id")) not in used_live_ids:
+            merged.append(live)
+
+    return merged
+
+
+def clear_live_library_cache():
+    try:
+        fetch_live_books_overlay.clear()
+    except Exception:
+        pass
+
+
 def fetch_books() -> list[dict]:
     static_books = load_static_library_books()
     if static_books:
-        return static_books
+        return merge_static_books_with_live_overlay(static_books)
     return fetch_books_from_supabase()
 
 
 
 def fetch_book_index() -> list[dict]:
     """Hızlı arama için sadece hafif alanları çeker."""
-    static_books = load_static_library_books()
+    static_books = fetch_books() if load_static_library_books() else []
     if static_books:
         return sorted(
             [{"id": book.get("id"), "isbn": clean_text(book.get("isbn")), "title": clean_text(book.get("title")), "author": clean_text(book.get("author"))} for book in static_books],
@@ -2324,7 +2407,7 @@ def fetch_book_by_id(book_id) -> dict | None:
 
 
 def fetch_library_summary() -> dict:
-    static_books = load_static_library_books()
+    static_books = fetch_books() if load_static_library_books() else []
     if static_books:
         return {
             "count": len(static_books),
@@ -2357,7 +2440,7 @@ def fetch_library_summary() -> dict:
 
 
 def fetch_dashboard_stats() -> dict:
-    rows = load_static_library_books()
+    rows = fetch_books() if load_static_library_books() else []
     if not rows:
         try:
             response = (
@@ -2433,6 +2516,7 @@ def update_book_estimated_price(book_id, price: float, source: str) -> bool:
                 "estimated_price_checked_at": datetime.now(timezone.utc).isoformat(),
             }
         ).eq("id", book_id).execute()
+        clear_live_library_cache()
         return True
     except Exception as exc:
         show_schema_error(exc)
@@ -2443,6 +2527,7 @@ def insert_book(data: dict) -> bool:
     payload = normalize_book_payload(data)
     try:
         supabase.table("books").insert(payload).execute()
+        clear_live_library_cache()
         return True
     except Exception as exc:
         show_schema_error(exc)
@@ -2453,6 +2538,7 @@ def update_book(book_id, data: dict) -> bool:
     payload = normalize_book_payload(data)
     try:
         supabase.table("books").update(payload).eq("id", book_id).execute()
+        clear_live_library_cache()
         return True
     except Exception as exc:
         show_schema_error(exc)
@@ -2462,6 +2548,7 @@ def update_book(book_id, data: dict) -> bool:
 def delete_book(book_id) -> bool:
     try:
         supabase.table("books").delete().eq("id", book_id).execute()
+        clear_live_library_cache()
         return True
     except Exception as exc:
         st.error(f"Silme işlemi başarısız: {exc}")
@@ -2867,7 +2954,9 @@ def build_static_library_zip(books: list[dict]) -> tuple[bytes, dict]:
             "static_library/README.txt",
             "GitHub web yuklemede 100 dosya sinirina takilirsan ZIP'i acma. "
             "Bu dosyayi static_library.zip adiyla app.py ile ayni seviyeye yukle. "
-            "Istersen ZIP'i acip static_library klasorunu de repo kokune koyabilirsin.\n",
+            "Istersen ZIP'i acip static_library klasorunu de repo kokune koyabilirsin. "
+            "Okunma durumu, not, puan gibi degisen alanlar Supabase'den canli alinir; "
+            "statik paket kitap bilgisi ve kapak icin hiz katmanidir.\n",
         )
     return buffer.getvalue(), {"books": len(package_books), "covers": downloaded, "cover_failures": failed}
 
