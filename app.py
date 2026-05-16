@@ -33,7 +33,7 @@ except Exception:
 
 
 APP_DIR = Path(__file__).resolve().parent
-APP_NAME = "Badgers' Kitap App"
+APP_NAME = "Badger's Book App"
 BRAND_IMAGE_PATHS = [
     APP_DIR / "assets" / "badger.png",
     APP_DIR / "badger.png",
@@ -171,7 +171,7 @@ SITE_SPECIFIC_RETAILERS = {
 }
 
 SITE_EXTRA_SEARCH_TEMPLATES = {
-    "Kitapse?": [
+    "Kitapseç": [
         "https://www.kitapsec.com/Arama/index.php?key={isbn}",
         "https://www.kitapsec.com/Mch.php?a={isbn}",
         "https://www.kitapsec.com/mobil/arama.php?a={isbn}",
@@ -1642,12 +1642,12 @@ def record_from_kitapsec_html(soup: BeautifulSoup, variants: list[str], source: 
         return None
     if not detail_isbn and not variant_in_text(variants, page_text):
         return None
-    publisher = normalize_publisher_name(kitapsec_detail_value(details, "Yay?nevi / Marka", "Yayinevi / Marka", "Yay?nevi", "Yay?nc?", "Marka"))
+    publisher = normalize_publisher_name(kitapsec_detail_value(details, "Yayınevi / Marka", "Yayinevi / Marka", "Yayınevi", "Yayıncı", "Marka"))
     h1 = soup.find("h1")
     title = clean_text(h1.get_text(" ") if h1 else meta_content(soup, "og:title", "twitter:title"))
     title = strip_publisher_from_title(title, publisher)
-    published_date = kitapsec_detail_value(details, "Bas?m Tarihi", "Yay?n Tarihi", "Yay?n Y?l?", "Bas?m Y?l?", "?lk Bask? Y?l?")
-    page_count = kitapsec_detail_value(details, "Sayfa Say?s?", "Sayfa")
+    published_date = kitapsec_detail_value(details, "Basım Tarihi", "Yayın Tarihi", "Yayın Yılı", "Basım Yılı", "İlk Baskı Yılı")
+    page_count = kitapsec_detail_value(details, "Sayfa Sayısı", "Sayfa")
     cover_url = meta_content(soup, "og:image", "twitter:image")
     if cover_url:
         cover_url = urljoin(url, cover_url)
@@ -1656,16 +1656,16 @@ def record_from_kitapsec_html(soup: BeautifulSoup, variants: list[str], source: 
     book.update({
         "title": title,
         "author": dedupe_comma_values(kitapsec_detail_value(details, "Yazar")),
-        "translator": dedupe_comma_values(kitapsec_detail_value(details, "?evirmen", "Cevirmen")),
+        "translator": dedupe_comma_values(kitapsec_detail_value(details, "Çevirmen", "Cevirmen")),
         "publisher": publisher,
         "page_count": clean_text(only_digits(page_count) or page_count),
-        "paper_type": kitapsec_detail_value(details, "Hamur Tipi", "Ka??t", "Ka??t Cinsi", "Kagit Cinsi"),
-        "dimensions": kitapsec_detail_value(details, "Kitap Ebat?", "Ebat", "Boyut", "Kitap Boyutu"),
+        "paper_type": kitapsec_detail_value(details, "Hamur Tipi", "Kağıt", "Kağıt Cinsi", "Kagit Cinsi"),
+        "dimensions": kitapsec_detail_value(details, "Kitap Ebatı", "Ebat", "Boyut", "Kitap Boyutu"),
         "first_print_year": first_year(published_date),
         "published_date": published_date,
-        "print_edition": kitapsec_detail_value(details, "Bask?", "Bask? Say?s?", "Baski Sayisi"),
-        "language": pretty_language(kitapsec_detail_value(details, "Dil", "Yay?n Dili", "Kitap Dili")),
-        "genre": kitapsec_detail_value(details, "Kategori", "T?r", "Konu"),
+        "print_edition": kitapsec_detail_value(details, "Baskı", "Baskı Sayısı", "Baski Sayisi"),
+        "language": pretty_language(kitapsec_detail_value(details, "Dil", "Yayın Dili", "Kitap Dili")),
+        "genre": kitapsec_detail_value(details, "Kategori", "Tür", "Konu"),
         "cover_url": cover_url,
         "source_url": url,
         "estimated_price": price,
@@ -2418,7 +2418,7 @@ def fetch_book_by_id(book_id) -> dict | None:
         rows = response.data or []
         return rows[0] if rows else None
     except Exception as exc:
-        st.warning(f"Kitap kayd? y?klenemedi: {exc}")
+        st.warning(f"Kitap kaydı yüklenemedi: {exc}")
         return None
 
 
@@ -3039,7 +3039,12 @@ def inject_css():
     st.markdown(
         """
         <style>
-        .block-container { padding-top: 1.4rem; }
+        .block-container {
+            padding-top: 1.4rem;
+            max-width: 98vw;
+            padding-left: 1.4rem;
+            padding-right: 1.4rem;
+        }
         [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p { margin-bottom: 0.25rem; }
         .brand-wrap {
             display: flex;
@@ -3438,7 +3443,7 @@ def kitapsec_update_payload(current: dict, fetched: dict) -> dict:
     for field in SAVE_FIELDS:
         if field in current:
             payload[field] = current.get(field)
-    bad_values = {"bulunamadi", "bulunamad?", "yok", "none", "null"}
+    bad_values = {"bulunamadi", "bulunamadı", "yok", "none", "null"}
     for field in BOOK_FIELDS:
         if field == "isbn":
             continue
@@ -3456,7 +3461,19 @@ def kitapsec_update_payload(current: dict, fetched: dict) -> dict:
 
 
 def kitapsec_preview_rows(current: dict, fetched: dict) -> list[dict]:
-    fields = [("title", "Kitap Ad?"), ("author", "Yazar"), ("translator", "?evirmen"), ("publisher", "Yay?nevi"), ("page_count", "Sayfa"), ("first_print_year", "Y?l"), ("paper_type", "Hamur"), ("dimensions", "Ebat"), ("language", "Dil"), ("genre", "T?r / Konu"), ("estimated_price", "Fiyat")]
+    fields = [
+        ("title", "Kitap Adı"),
+        ("author", "Yazar"),
+        ("translator", "Çevirmen"),
+        ("publisher", "Yayınevi"),
+        ("page_count", "Sayfa"),
+        ("first_print_year", "Yıl"),
+        ("paper_type", "Hamur"),
+        ("dimensions", "Ebat"),
+        ("language", "Dil"),
+        ("genre", "Tür / Konu"),
+        ("estimated_price", "Fiyat"),
+    ]
     rows = []
     for field, label in fields:
         old_value = current.get(field)
@@ -3468,7 +3485,7 @@ def kitapsec_preview_rows(current: dict, fetched: dict) -> list[dict]:
             old_text = clean_text(old_value)
             new_text = clean_text(new_value)
         if old_text or new_text:
-            rows.append({"Alan": label, "Mevcut Bilgi": old_text, "Kitapse? Bilgisi": new_text})
+            rows.append({"Alan": label, "Mevcut Bilgi": old_text, "Kitapseç Bilgisi": new_text})
     return rows
 
 
@@ -3478,23 +3495,23 @@ def render_kitapsec_update_controls(book: dict):
     result_key = f"library_kitapsec_result_{book_id}"
     error_key = f"library_kitapsec_error_{book_id}"
     st.divider()
-    st.subheader("Kitapse? G?ncelleme")
+    st.subheader("Kitapseç Güncelleme")
     fetch_col, clear_col = st.columns([0.72, 0.28])
     with fetch_col:
-        if st.button("Kitapse?'ten G?ncelle", key=f"kitapsec_fetch_{book_id}", use_container_width=True):
+        if st.button("Kitapseç'ten Güncelle", key=f"kitapsec_fetch_{book_id}", use_container_width=True):
             st.session_state.pop(error_key, None)
             if not isbn:
-                st.session_state[error_key] = "Bu kitapta ISBN yok; Kitapse? aramas? yap?lamaz."
+                st.session_state[error_key] = "Bu kitapta ISBN yok; Kitapseç araması yapılamaz."
             else:
-                with st.spinner(f"{isbn} Kitapse?'te aran?yor..."):
+                with st.spinner(f"{isbn} Kitapseç'te aranıyor..."):
                     lookup = lookup_specific_retailer(isbn, "kitapsec", max_seconds=20, link_limit=12)
                 if lookup.get("ok") and lookup.get("book", {}).get("title"):
                     st.session_state[result_key] = lookup["book"]
                 else:
                     st.session_state.pop(result_key, None)
-                    st.session_state[error_key] = lookup.get("error") or "Kitapse? ?zerinde g?venilir kay?t bulunamad?."
+                    st.session_state[error_key] = lookup.get("error") or "Kitapseç üzerinde güvenilir kayıt bulunamadı."
     with clear_col:
-        if st.button("?nizlemeyi Temizle", key=f"kitapsec_clear_{book_id}", use_container_width=True):
+        if st.button("Önizlemeyi Temizle", key=f"kitapsec_clear_{book_id}", use_container_width=True):
             st.session_state.pop(result_key, None)
             st.session_state.pop(error_key, None)
             st.rerun()
@@ -3503,29 +3520,29 @@ def render_kitapsec_update_controls(book: dict):
     fetched = st.session_state.get(result_key)
     if not fetched:
         return
-    st.info("Kitapse? bilgileri bulundu. Sadece onay verirsen mevcut kitap g?ncellenir; bo? gelen alanlar eski bilgiyi silmez.")
+    st.info("Kitapseç bilgileri bulundu. Sadece onay verirsen mevcut kitap güncellenir; boş gelen alanlar eski bilgiyi silmez.")
     preview_col, cover_col = st.columns([0.78, 0.22])
     with preview_col:
         rows = kitapsec_preview_rows(book, fetched)
         if rows:
             st.dataframe(rows, use_container_width=True, hide_index=True)
         if clean_text(fetched.get("source_url")):
-            st.markdown(f"[Kitapse? sayfas?n? a?]({fetched['source_url']})")
+            st.markdown(f"[Kitapseç sayfasını aç]({fetched['source_url']})")
     with cover_col:
         render_cover(fetched.get("cover_url"), width=110)
     confirm_col, cancel_col = st.columns(2)
     with confirm_col:
-        if st.button("Evet, Bu Bilgilerle G?ncelle", type="primary", key=f"kitapsec_confirm_{book_id}", use_container_width=True):
+        if st.button("Evet, Bu Bilgilerle Güncelle", type="primary", key=f"kitapsec_confirm_{book_id}", use_container_width=True):
             if update_book(book.get("id"), kitapsec_update_payload(book, fetched)):
                 st.session_state.pop(result_key, None)
                 st.session_state.pop(error_key, None)
-                st.success("Kitap Kitapse? bilgileriyle g?ncellendi.")
+                st.success("Kitap Kitapseç bilgileriyle güncellendi.")
                 st.rerun()
     with cancel_col:
-        if st.button("Hay?r, Dokunma", key=f"kitapsec_cancel_{book_id}", use_container_width=True):
+        if st.button("Hayır, Dokunma", key=f"kitapsec_cancel_{book_id}", use_container_width=True):
             st.session_state.pop(result_key, None)
             st.session_state.pop(error_key, None)
-            st.info("G?ncelleme yap?lmad?.")
+            st.info("Güncelleme yapılmadı.")
             st.rerun()
 
 
@@ -3535,39 +3552,39 @@ def update_single_book_from_kitapsec(book: dict, max_seconds: int = 18) -> tuple
         return "skipped", f"{book_title(book)}: ISBN yok"
     lookup = lookup_specific_retailer(isbn, "kitapsec", max_seconds=max_seconds, link_limit=12)
     if not lookup.get("ok") or not lookup.get("book", {}).get("title"):
-        return "not_found", f"{isbn}: Kitapse? kayd? bulunamad?"
+        return "not_found", f"{isbn}: Kitapseç kaydı bulunamadı"
     payload = kitapsec_update_payload(book, lookup["book"])
     if update_book(book.get("id"), payload):
         return "updated", f"{isbn}: {clean_text(payload.get('title')) or book_title(book)}"
-    return "error", f"{isbn}: g?ncelleme kaydedilemedi"
+    return "error", f"{isbn}: güncelleme kaydedilemedi"
 
 
 def render_library_kitapsec_bulk_controls(all_books: list[dict], visible_books: list[dict]):
-    st.subheader("Toplu Kitapse? G?ncelleme")
-    st.caption("Kitapse? bo? bilgi d?nd?r?rse mevcut dolu alanlar korunur; okuma durumu, kategori, not, etiket ve puan de?i?mez.")
+    st.subheader("Toplu Kitapseç Güncelleme")
+    st.caption("Kitapseç boş bilgi döndürürse mevcut dolu alanlar korunur; okuma durumu, kategori, not, etiket ve puan değişmez.")
     c1, c2 = st.columns(2)
     with c1:
-        if st.button(f"G?r?nen {len(visible_books)} Kitab? Kitapse?'ten G?ncelle", use_container_width=True, disabled=not visible_books, key="kitapsec_bulk_visible"):
-            run_library_kitapsec_bulk_update(visible_books, "G?r?nen kitaplar")
+        if st.button(f"Görünen {len(visible_books)} Kitabı Kitapseç'ten Güncelle", use_container_width=True, disabled=not visible_books, key="kitapsec_bulk_visible"):
+            run_library_kitapsec_bulk_update(visible_books, "Görünen kitaplar")
     with c2:
-        if st.button(f"T?m {len(all_books)} Kitab? Kitapse?'ten G?ncelle", use_container_width=True, disabled=not all_books, key="kitapsec_bulk_all"):
-            run_library_kitapsec_bulk_update(all_books, "T?m k?t?phane")
+        if st.button(f"Tüm {len(all_books)} Kitabı Kitapseç'ten Güncelle", use_container_width=True, disabled=not all_books, key="kitapsec_bulk_all"):
+            run_library_kitapsec_bulk_update(all_books, "Tüm kütüphane")
 
 
 def run_library_kitapsec_bulk_update(target_books: list[dict], label: str):
     books_with_isbn = [book for book in target_books if clean_text(book.get("isbn"))]
     if not books_with_isbn:
-        st.warning("G?ncellenecek ISBN'li kitap yok.")
+        st.warning("Güncellenecek ISBN'li kitap yok.")
         return
     progress = st.progress(0)
     status_box = st.empty()
     result = {"updated": 0, "not_found": 0, "skipped": 0, "error": 0}
     for index, book in enumerate(books_with_isbn, start=1):
         progress.progress(index / len(books_with_isbn))
-        status_box.info(f"{index}/{len(books_with_isbn)} Kitapse?'ten g?ncelleniyor: {book.get('isbn')}")
+        status_box.info(f"{index}/{len(books_with_isbn)} Kitapseç'ten güncelleniyor: {book.get('isbn')}")
         status, _ = update_single_book_from_kitapsec(book, max_seconds=18)
         result[status] = result.get(status, 0) + 1
-    status_box.success(f"{label} tamamland?. G?ncellenen: {result['updated']} ? Bulunamayan: {result['not_found']} ? Hata: {result['error']}")
+    status_box.success(f"{label} tamamlandı. Güncellenen: {result['updated']} · Bulunamayan: {result['not_found']} · Hata: {result['error']}")
 
 
 
@@ -4574,7 +4591,14 @@ def render_library_page(all_books: list[dict], filters: tuple):
     st.header("Detaylı Kütüphanem")
     render_static_library_package_controls()
 
-    filtered = filter_books(all_books, search_term, personal_filter, status_filter, tag_filter)
+    inline_search = st.text_input(
+        "Listede ara",
+        placeholder="Kitap adı, yazar, yayınevi veya ISBN yaz",
+        key="detail_library_inline_search",
+    )
+    active_search_term = inline_search or search_term
+
+    filtered = filter_books(all_books, active_search_term, personal_filter, status_filter, tag_filter)
     books = sort_books(filtered, sort_by)
 
     total = len(all_books)
@@ -4587,13 +4611,47 @@ def render_library_page(all_books: list[dict], filters: tuple):
         return
 
     book_by_key = {book_identity_key(book): book for book in books}
+    visible_keys = set(book_by_key)
+    selected_keys = [
+        key
+        for key in st.session_state.get("detail_library_selected_keys", [])
+        if key in visible_keys
+    ]
     selected_key = st.session_state.get("detail_library_selected_key", "")
+    if selected_key and selected_key not in visible_keys:
+        selected_key = ""
+    if selected_key and selected_key not in selected_keys:
+        selected_keys.append(selected_key)
+
+    st.session_state["detail_library_selected_keys"] = selected_keys
+    if selected_key:
+        st.session_state["detail_library_selected_key"] = selected_key
+    else:
+        st.session_state.pop("detail_library_selected_key", None)
+
+    st.session_state.setdefault("detail_library_editor_nonce", 0)
+    action_col1, action_col2, action_col3 = st.columns([0.18, 0.22, 0.60])
+    with action_col1:
+        if st.button("Tümünü Seç", use_container_width=True, key="detail_library_select_all"):
+            st.session_state["detail_library_selected_keys"] = list(book_by_key.keys())
+            if books:
+                st.session_state["detail_library_selected_key"] = book_identity_key(books[0])
+            st.session_state["detail_library_editor_nonce"] += 1
+            st.rerun()
+    with action_col2:
+        if st.button("İşaretli Kutuları Temizle", use_container_width=True, key="detail_library_clear_selection"):
+            st.session_state["detail_library_selected_keys"] = []
+            st.session_state.pop("detail_library_selected_key", None)
+            st.session_state["detail_library_editor_nonce"] += 1
+            st.rerun()
+
+    selected_keys_set = set(st.session_state.get("detail_library_selected_keys", []))
     rows = []
     for book in books:
         key = book_identity_key(book)
         rows.append(
             {
-                "Detay": key == selected_key,
+                "Detay": key in selected_keys_set,
                 "Kitap Adı": book_title(book),
                 "Yazar": book_author(book),
                 "Yayınevi": clean_text(book.get("publisher")),
@@ -4607,8 +4665,9 @@ def render_library_page(all_books: list[dict], filters: tuple):
         rows,
         use_container_width=True,
         hide_index=True,
+        height=620,
         num_rows="fixed",
-        key="detail_library_lazy_list",
+        key=f"detail_library_lazy_list_{st.session_state['detail_library_editor_nonce']}",
         column_config={
             "Detay": st.column_config.CheckboxColumn("Detay"),
             "Kitap Adı": st.column_config.TextColumn("Kitap Adı", disabled=True),
@@ -4621,16 +4680,37 @@ def render_library_page(all_books: list[dict], filters: tuple):
     )
 
     selected_rows = [row for row in editor_rows_to_list(edited) if row.get("Detay")]
+    selected_keys = [clean_text(row.get("_key")) for row in selected_rows if clean_text(row.get("_key"))]
+    st.session_state["detail_library_selected_keys"] = selected_keys
     if selected_rows:
-        selected_key = clean_text(selected_rows[-1].get("_key"))
+        if selected_key not in selected_keys:
+            selected_key = selected_keys[-1]
         st.session_state["detail_library_selected_key"] = selected_key
-    elif selected_key not in book_by_key:
+    else:
         selected_key = ""
         st.session_state.pop("detail_library_selected_key", None)
 
     if not selected_key:
         st.info("Detayını görmek istediğin kitabın satırındaki Detay kutusunu işaretle.")
         return
+
+    if len(selected_keys) > 1:
+        selected_label_map = {
+            f"{book_title(book_by_key[key])} - {book_author(book_by_key[key])} [{clean_text(book_by_key[key].get('isbn'))}]": key
+            for key in selected_keys
+            if key in book_by_key
+        }
+        labels = list(selected_label_map.keys())
+        if labels:
+            current_label = next((label for label, key in selected_label_map.items() if key == selected_key), labels[0])
+            selected_label = st.selectbox(
+                "Detayı açılacak kitap",
+                labels,
+                index=labels.index(current_label),
+                key="detail_library_active_detail",
+            )
+            selected_key = selected_label_map[selected_label]
+            st.session_state["detail_library_selected_key"] = selected_key
 
     selected_book = book_by_key.get(selected_key)
     if not selected_book:
