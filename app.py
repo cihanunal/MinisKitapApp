@@ -50,7 +50,7 @@ HTTP_HEADERS = {
 }
 
 REQUEST_TIMEOUT = 8
-LOOKUP_CACHE_VERSION = 7
+LOOKUP_CACHE_VERSION = 8
 BULK_LOOKUP_TIMEOUT_SECONDS = 20
 
 PAGE_LABELS = {
@@ -164,7 +164,8 @@ SITE_SPECIFIC_RETAILERS = {
 }
 
 SITE_EXTRA_SEARCH_TEMPLATES = {
-    "Kitapseç": [
+    "Kitapse?": [
+        "https://www.kitapsec.com/Arama/index.php?key={isbn}",
         "https://www.kitapsec.com/Mch.php?a={isbn}",
         "https://www.kitapsec.com/mobil/arama.php?a={isbn}",
     ],
@@ -1477,8 +1478,100 @@ def sanitize_scraped_record(record: dict, variants: list[str], source: str) -> d
     return record
 
 
+
+def kitapsec_detail_value(details: dict, *labels: str) -> str:
+    wanted = [canonical_key(label) for label in labels]
+    for label, value in details.items():
+        key = canonical_key(label)
+        if any(key == item or item in key for item in wanted):
+            return clean_field_value(value)
+    return ""
+
+
+def record_from_kitapsec_html(soup: BeautifulSoup, variants: list[str], source: str, url: str) -> dict | None:
+    labels = soup.find_all("div", class_="baslikText")
+    values = soup.find_all("div", class_="sonucText")
+    details = {}
+
+    for label, value in zip(labels, values):
+        label_text = clean_text(label.get_text(" "))
+        value_text = clean_text(value.get_text(" "))
+        if label_text and value_text:
+            details[label_text] = value_text
+
+    if not details:
+        return None
+
+    page_text = soup.get_text(" ")
+    detail_isbn = kitapsec_detail_value(details, "ISBN / BARKOD", "ISBN", "Barkod")
+    if detail_isbn and not variant_in_text(variants, detail_isbn):
+        return None
+    if not detail_isbn and not variant_in_text(variants, page_text):
+        return None
+
+    publisher = normalize_publisher_name(
+        kitapsec_detail_value(
+            details,
+            "Yay?nevi / Marka",
+            "Yayinevi / Marka",
+            "Yay?nevi",
+            "Yay?nc?",
+            "Marka",
+        )
+    )
+    h1 = soup.find("h1")
+    title = clean_text(h1.get_text(" ") if h1 else meta_content(soup, "og:title", "twitter:title"))
+    title = strip_publisher_from_title(title, publisher)
+
+    published_date = kitapsec_detail_value(
+        details,
+        "Bas?m Tarihi",
+        "Yay?n Tarihi",
+        "Yay?n Y?l?",
+        "Bas?m Y?l?",
+        "?lk Bask? Y?l?",
+    )
+    page_count = kitapsec_detail_value(details, "Sayfa Say?s?", "Sayfa")
+    cover_url = meta_content(soup, "og:image", "twitter:image")
+    if cover_url:
+        cover_url = urljoin(url, cover_url)
+
+    price = extract_price_from_text(page_text, source)
+
+    book = blank_book(variants[0])
+    book.update(
+        {
+            "title": title,
+            "author": dedupe_comma_values(kitapsec_detail_value(details, "Yazar")),
+            "translator": dedupe_comma_values(kitapsec_detail_value(details, "?evirmen", "Cevirmen")),
+            "publisher": publisher,
+            "page_count": clean_text(only_digits(page_count) or page_count),
+            "paper_type": kitapsec_detail_value(details, "Hamur Tipi", "Ka??t", "Ka??t Cinsi", "Kagit Cinsi"),
+            "dimensions": kitapsec_detail_value(details, "Kitap Ebat?", "Ebat", "Boyut", "Kitap Boyutu"),
+            "first_print_year": first_year(published_date),
+            "published_date": published_date,
+            "print_edition": kitapsec_detail_value(details, "Bask?", "Bask? Say?s?", "Baski Sayisi"),
+            "language": pretty_language(kitapsec_detail_value(details, "Dil", "Yay?n Dili", "Kitap Dili")),
+            "genre": kitapsec_detail_value(details, "Kategori", "T?r", "Konu"),
+            "cover_url": cover_url,
+            "source_url": url,
+            "estimated_price": price,
+            "estimated_price_source": source if price else "",
+            "estimated_price_checked_at": datetime.now(timezone.utc).isoformat() if price else "",
+            "_source": source,
+            "_isbn_matched": True,
+        }
+    )
+    return sanitize_scraped_record(book, variants, source)
+
+
 def extract_book_from_html(html: str, variants: list[str], source: str, url: str) -> dict | None:
     soup = BeautifulSoup(html, "html.parser")
+    if "kitapsec" in canonical_key(source):
+        kitapsec_record = record_from_kitapsec_html(soup, variants, source, url)
+        if kitapsec_record:
+            return kitapsec_record
+
     page_text = soup.get_text(" ")
     page_price = extract_price_from_text(page_text, source)
     page_has_isbn = variant_in_text(variants, page_text)
@@ -1616,6 +1709,35 @@ def candidate_product_links(soup: BeautifulSoup, base_url: str, variants: list[s
     return ordered
 
 
+
+def is_kitapsec_product_url(url: str) -> bool:
+    path = urlparse(url).path.casefold()
+    return (
+        "/products/" in path and path.endswith(".html")
+    ) or (
+        "/mobil/" in path and "_urn" in path and path.endswith(".html")
+    )
+
+
+def kitapsec_product_links(soup: BeautifulSoup, base_url: str, variants: list[str]) -> list[str]:
+    matched = []
+    others = []
+
+    for anchor in soup.find_all("a", href=True):
+        full_url = urljoin(base_url, anchor["href"].strip())
+        if not is_kitapsec_product_url(full_url):
+            continue
+
+        link_text = clean_text(anchor.get_text(" "))
+        target = f"{full_url} {link_text}"
+        if variant_in_text(variants, target):
+            matched.append(full_url)
+        else:
+            others.append(full_url)
+
+    return unique_keep_order([*matched, *others])
+
+
 def search_specific_retailer(
     variants: list[str],
     source: str,
@@ -1645,7 +1767,14 @@ def search_specific_retailer(
                 break
 
             soup = BeautifulSoup(html, "html.parser")
-            for link in candidate_product_links(soup, final_url, variants)[:link_limit]:
+            product_links = []
+            if "kitapsec" in canonical_key(source):
+                product_links = kitapsec_product_links(soup, final_url, variants)
+
+            if not product_links:
+                product_links = candidate_product_links(soup, final_url, variants)
+
+            for link in product_links[:link_limit]:
                 if deadline_expired(deadline):
                     break
                 if link in seen_links:
