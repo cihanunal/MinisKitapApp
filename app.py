@@ -3027,6 +3027,122 @@ def build_form_data(prefix: str, initial: dict) -> dict:
     }
 
 
+def kitapsec_update_payload(current: dict, fetched: dict) -> dict:
+    payload = dict(current)
+    payload["isbn"] = clean_text(current.get("isbn")) or clean_text(fetched.get("isbn"))
+
+    for field in BOOK_FIELDS:
+        if field == "isbn":
+            continue
+        if field == "estimated_price":
+            value = fetched.get(field)
+            if value not in ("", None):
+                payload[field] = value
+            continue
+
+        value = clean_text(fetched.get(field))
+        if value:
+            payload[field] = value
+
+    for field in ("category", "reading_status", "favorite", "tags", "notes", "loaned_to", "rating"):
+        payload[field] = current.get(field)
+    return payload
+
+
+def kitapsec_preview_rows(current: dict, fetched: dict) -> list[dict]:
+    fields = [
+        ("title", "Kitap Adı"),
+        ("author", "Yazar"),
+        ("translator", "Çevirmen"),
+        ("publisher", "Yayınevi"),
+        ("page_count", "Sayfa"),
+        ("first_print_year", "Yıl"),
+        ("paper_type", "Hamur"),
+        ("dimensions", "Ebat"),
+        ("language", "Dil"),
+        ("genre", "Tür / Konu"),
+        ("estimated_price", "Fiyat"),
+    ]
+    rows = []
+    for field, label in fields:
+        old_value = current.get(field)
+        new_value = fetched.get(field)
+        if field == "estimated_price":
+            old_text = format_tl(old_value) if old_value else ""
+            new_text = format_tl(new_value) if new_value else ""
+        else:
+            old_text = clean_text(old_value)
+            new_text = clean_text(new_value)
+        if old_text or new_text:
+            rows.append({"Alan": label, "Mevcut Bilgi": old_text, "Kitapseç Bilgisi": new_text})
+    return rows
+
+
+def render_kitapsec_update_controls(book: dict):
+    book_id = clean_text(book.get("id")) or normalize_lookup_isbn(book.get("isbn")) or canonical_key(book_title(book))
+    isbn = clean_text(book.get("isbn"))
+    result_key = f"library_kitapsec_result_{book_id}"
+    error_key = f"library_kitapsec_error_{book_id}"
+
+    st.divider()
+    st.subheader("Kitapseç Güncelleme")
+
+    fetch_col, clear_col = st.columns([0.72, 0.28])
+    with fetch_col:
+        if st.button("Kitapseç'ten Güncelle", key=f"kitapsec_fetch_{book_id}", use_container_width=True):
+            st.session_state.pop(error_key, None)
+            if not isbn:
+                st.session_state[error_key] = "Bu kitapta ISBN yok; Kitapseç araması yapılamaz."
+            else:
+                with st.spinner(f"{isbn} Kitapseç'te aranıyor..."):
+                    lookup = lookup_specific_retailer(isbn, "kitapsec", max_seconds=20, link_limit=12)
+                if lookup.get("ok") and lookup.get("book", {}).get("title"):
+                    st.session_state[result_key] = lookup["book"]
+                    st.session_state.pop(error_key, None)
+                else:
+                    st.session_state.pop(result_key, None)
+                    st.session_state[error_key] = lookup.get("error") or "Kitapseç üzerinde güvenilir kayıt bulunamadı."
+    with clear_col:
+        if st.button("Önizlemeyi Temizle", key=f"kitapsec_clear_{book_id}", use_container_width=True):
+            st.session_state.pop(result_key, None)
+            st.session_state.pop(error_key, None)
+            st.rerun()
+
+    if st.session_state.get(error_key):
+        st.warning(st.session_state[error_key])
+
+    fetched = st.session_state.get(result_key)
+    if not fetched:
+        return
+
+    st.info("Kitapseç bilgileri bulundu. Aşağıdan kontrol et; sadece onay verirsen mevcut kitap güncellenir.")
+    preview_col, cover_col = st.columns([0.78, 0.22])
+    with preview_col:
+        rows = kitapsec_preview_rows(book, fetched)
+        if rows:
+            st.dataframe(rows, use_container_width=True, hide_index=True)
+        if clean_text(fetched.get("source_url")):
+            st.markdown(f"[Kitapseç sayfasını aç]({fetched['source_url']})")
+    with cover_col:
+        render_cover(fetched.get("cover_url"), width=110)
+
+    confirm_col, cancel_col = st.columns(2)
+    with confirm_col:
+        if st.button("Evet, Bu Bilgilerle Güncelle", type="primary", key=f"kitapsec_confirm_{book_id}", use_container_width=True):
+            payload = kitapsec_update_payload(book, fetched)
+            if update_book(book.get("id"), payload):
+                st.session_state.pop(result_key, None)
+                st.session_state.pop(error_key, None)
+                st.success("Kitap Kitapseç bilgileriyle güncellendi.")
+                st.rerun()
+    with cancel_col:
+        if st.button("Hayır, Dokunma", key=f"kitapsec_cancel_{book_id}", use_container_width=True):
+            st.session_state.pop(result_key, None)
+            st.session_state.pop(error_key, None)
+            st.info("Güncelleme yapılmadı.")
+            st.rerun()
+
+
 def render_book_details(book: dict):
     cover_col, info_col, more_col = st.columns([0.13, 0.47, 0.40])
     with cover_col:
@@ -3045,6 +3161,7 @@ def render_book_details(book: dict):
         st.write(f"**Ödünç:** {book.get('loaned_to') or '-'}")
         if clean_text(book.get("notes")):
             st.write(f"**Not:** {book.get('notes')}")
+    render_kitapsec_update_controls(book)
 
 
 def render_book_editor(book: dict):
