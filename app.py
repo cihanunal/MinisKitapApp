@@ -56,6 +56,7 @@ BULK_LOOKUP_TIMEOUT_SECONDS = 20
 PAGE_LABELS = {
     "home": "✨ Ana Ekran",
     "library": "🏠 Kütüphanem",
+    "detail_library": "Detayl\u0131 K\u00fct\u00fcphanem",
     "add": "🔍 Kitap Ekle",
     "quick_search": "⚡ Hızlı Arama",
     "bulk_add": "🧾 Toplu Kitap Ekle",
@@ -2233,6 +2234,24 @@ def fetch_book_index() -> list[dict]:
         return []
 
 
+def fetch_book_by_id(book_id) -> dict | None:
+    if not book_id:
+        return None
+    try:
+        response = (
+            supabase.table("books")
+            .select("*")
+            .eq("id", book_id)
+            .limit(1)
+            .execute()
+        )
+        rows = response.data or []
+        return rows[0] if rows else None
+    except Exception as exc:
+        st.warning(f"Kitap kaydı yüklenemedi: {exc}")
+        return None
+
+
 def fetch_library_summary() -> dict:
     summary = {"count": 0, "recent": []}
     try:
@@ -2841,7 +2860,7 @@ def render_sidebar(all_books: list[dict] | None = None):
     selected_page = reverse_labels[selected_label]
     st.session_state["page"] = selected_page
 
-    if selected_page != "library":
+    if selected_page != "detail_library":
         return "Tümü", "Tümü", "Tüm Etiketler", "", "Eser Adı (A-Z)", []
 
     if all_books is None:
@@ -3359,7 +3378,132 @@ def render_book_editor(book: dict):
                 st.rerun()
 
 
+def filter_book_index(book_index: list[dict], search_term: str) -> list[dict]:
+    if not search_term:
+        return book_index
+
+    needle = canonical_key(search_term)
+    digit_needle = only_digits(search_term)
+    preview = []
+    for book in book_index:
+        haystack = canonical_key(
+            " ".join(
+                [
+                    clean_text(book.get("title")),
+                    clean_text(book.get("author")),
+                    clean_text(book.get("isbn")),
+                ]
+            )
+        )
+        isbn_digits = only_digits(book.get("isbn"))
+        if needle in haystack or (digit_needle and digit_needle in isbn_digits):
+            preview.append(book)
+    return preview
+
+
+def run_light_library_kitapsec_updates(rows: list[dict], label: str):
+    selected = [row for row in rows if row.get("Kitapseç'ten Güncelle")]
+    if not selected:
+        st.warning("Önce güncellenecek kitapları işaretle.")
+        return
+
+    progress = st.progress(0)
+    status_box = st.empty()
+    result = {"label": label, "updated": 0, "not_found": 0, "skipped": 0, "error": 0, "examples": []}
+
+    for index, row in enumerate(selected, start=1):
+        progress.progress(index / len(selected))
+        isbn = clean_text(row.get("ISBN"))
+        status_box.info(f"{index}/{len(selected)} Kitapseç'ten güncelleniyor: {isbn or row.get('Kitap Adı')}")
+
+        current = fetch_book_by_id(row.get("id"))
+        if not current:
+            status = "error"
+            message = f"{isbn or row.get('Kitap Adı')}: veritabanı kaydı yüklenemedi"
+        else:
+            status, message = update_single_book_from_kitapsec(current, max_seconds=18)
+
+        result[status] = result.get(status, 0) + 1
+        if len(result["examples"]) < 30:
+            result["examples"].append(message)
+
+    status_box.success("Kitapseç güncellemesi tamamlandı.")
+    st.session_state["light_library_update_result"] = result
+    st.rerun()
+
+
+def render_light_library_page(book_index: list[dict], title: str = "Kütüphanem"):
+    st.header(title)
+    st.caption("Bu sayfa hızlı açılır; sadece kitap adı, yazar ve ISBN bilgisini yükler. Detay ve kapaklar Detaylı Kütüphanem sayfasındadır.")
+
+    last_result = st.session_state.pop("light_library_update_result", None)
+    if last_result:
+        st.success(
+            f"{last_result['label']} tamamlandı. "
+            f"Güncellenen: {last_result['updated']} · "
+            f"Bulunamayan: {last_result['not_found']} · "
+            f"Atlanan: {last_result['skipped']} · "
+            f"Hata: {last_result['error']}"
+        )
+        if last_result.get("examples"):
+            with st.expander("Son işlem özeti"):
+                for item in last_result["examples"][:30]:
+                    st.write(f"- {item}")
+
+    st.metric("Hızlı listedeki kitap", len(book_index))
+    search_term = st.text_input(
+        "Kitap adı, yazar veya ISBN ara",
+        placeholder="Örn: Kürk Mantolu Madonna veya 978...",
+        key="light_library_search",
+    )
+
+    preview = filter_book_index(book_index, search_term)
+    if not preview:
+        st.warning("Bu aramada kayıtlı kitap görünmüyor.")
+        return
+
+    rows = [
+        {
+            "Kitapseç'ten Güncelle": False,
+            "Kitap Adı": clean_text(book.get("title")),
+            "Yazar": clean_text(book.get("author")),
+            "ISBN": clean_text(book.get("isbn")),
+            "id": book.get("id"),
+        }
+        for book in preview
+    ]
+
+    edited = st.data_editor(
+        rows,
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+        key="light_library_editor",
+        column_config={
+            "Kitapseç'ten Güncelle": st.column_config.CheckboxColumn("Kitapseç'ten Güncelle"),
+            "Kitap Adı": st.column_config.TextColumn("Kitap Adı", disabled=True),
+            "Yazar": st.column_config.TextColumn("Yazar", disabled=True),
+            "ISBN": st.column_config.TextColumn("ISBN", disabled=True),
+            "id": None,
+        },
+    )
+    edited_rows = editor_rows_to_list(edited)
+    selected_count = sum(1 for row in edited_rows if row.get("Kitapseç'ten Güncelle"))
+    st.caption(f"Gösterilen kayıt: {len(preview)} · Güncelleme için işaretlenen: {selected_count}")
+
+    if st.button(
+        f"Seçili {selected_count} Kitabı Kitapseç'ten Güncelle",
+        type="primary",
+        use_container_width=True,
+        disabled=selected_count == 0,
+    ):
+        run_light_library_kitapsec_updates(edited_rows, "Seçili hızlı kütüphane kayıtları")
+
+
 def render_quick_search_page(book_index: list[dict]):
+    render_light_library_page(book_index, title="Hızlı Arama")
+    return
+
     st.header("Hızlı Arama")
     st.caption("Bu ekran sadece kitap adı, yazar ve barkod bilgisini kullanır; detaylı Kütüphanem ekranından çok daha hafif çalışır.")
 
@@ -4223,7 +4367,7 @@ def render_bulk_add_page():
 
 def render_library_page(all_books: list[dict], filters: tuple):
     personal_filter, status_filter, tag_filter, search_term, sort_by = filters
-    st.header("Kitaplığım")
+    st.header("Detaylı Kütüphanem")
 
     filtered = filter_books(all_books, search_term, personal_filter, status_filter, tag_filter)
     books = sort_books(filtered, sort_by)
@@ -4538,10 +4682,14 @@ render_top_bar()
 
 if st.session_state.get("page") == "home":
     render_home_page()
+elif st.session_state.get("page") == "library":
+    render_light_library_page(book_index)
 elif st.session_state.get("page") == "add":
     render_add_page()
 elif st.session_state.get("page") == "quick_search":
     render_quick_search_page(book_index)
+elif st.session_state.get("page") == "detail_library":
+    render_library_page(all_books, filters[:5])
 elif st.session_state.get("page") == "bulk_add":
     render_bulk_add_page()
 elif st.session_state.get("page") == "lookup_queue":
@@ -4553,4 +4701,4 @@ elif st.session_state.get("page") == "recommendations":
 elif st.session_state.get("page") == "game":
     render_game_page(book_index)
 else:
-    render_library_page(all_books, filters[:5])
+    render_light_library_page(book_index)
