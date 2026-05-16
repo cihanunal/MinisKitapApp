@@ -3,6 +3,7 @@ import csv
 import html
 import io
 import json
+import random
 import re
 import time
 import unicodedata
@@ -53,11 +54,15 @@ LOOKUP_CACHE_VERSION = 4
 BULK_LOOKUP_TIMEOUT_SECONDS = 20
 
 PAGE_LABELS = {
+    "home": "✨ Ana Ekran",
     "library": "🏠 Kütüphanem",
     "add": "🔍 Kitap Ekle",
     "quick_search": "⚡ Hızlı Arama",
     "bulk_add": "🧾 Toplu Kitap Ekle",
     "lookup_queue": "⏳ Sonra Aranacaklar",
+    "wishlist": "💫 Wishlist",
+    "recommendations": "🎁 Tavsiyeler",
+    "game": "🎮 Oyun Oyna",
 }
 
 READING_STATUS_OPTIONS = [
@@ -107,6 +112,9 @@ BOOK_FIELDS = [
     "description",
     "cover_url",
     "source_url",
+    "estimated_price",
+    "estimated_price_source",
+    "estimated_price_checked_at",
 ]
 
 SAVE_FIELDS = [
@@ -126,6 +134,9 @@ SAVE_FIELDS = [
     "description",
     "cover_url",
     "source_url",
+    "estimated_price",
+    "estimated_price_source",
+    "estimated_price_checked_at",
     "category",
     "reading_status",
     "favorite",
@@ -140,8 +151,11 @@ TURKISH_RETAILERS = [
     ("Kitapyurdu", "https://www.kitapyurdu.com/index.php?route=product/search&filter_name={isbn}"),
     ("BKM Kitap", "https://www.bkmkitap.com/arama?q={isbn}"),
     ("Kitapsepeti", "https://www.kitapsepeti.com/arama?q={isbn}"),
+    ("Kitapseç", "https://www.kitapsec.com/Arama/index.php?key={isbn}"),
     ("Idefix", "https://www.idefix.com/search?q={isbn}"),
     ("İkra Kitap", "https://www.ikrakitap.com/arama?q={isbn}"),
+    ("İmge", "https://www.imge.com.tr/arama?q={isbn}"),
+    ("Amazon TR", "https://www.amazon.com.tr/s?k={isbn}"),
 ]
 
 DIRECT_ISBN_PAGES = [
@@ -200,6 +214,9 @@ def blank_book(isbn: str = "") -> dict:
     book["notes"] = ""
     book["loaned_to"] = ""
     book["rating"] = None
+    book["estimated_price"] = None
+    book["estimated_price_source"] = ""
+    book["estimated_price_checked_at"] = ""
     return book
 
 
@@ -263,6 +280,69 @@ def normalize_publisher_name(value: str) -> str:
         else:
             normalized_parts.append(part)
     return ", ".join(unique_keep_order(normalized_parts))
+
+
+def parse_turkish_price(value: str) -> float | None:
+    value = clean_text(value)
+    if not value:
+        return None
+    if re.fullmatch(r"\d{1,6}(?:\.\d{1,2})?", value):
+        try:
+            price = float(value)
+            return round(price, 2) if 0 < price <= 100000 else None
+        except Exception:
+            return None
+    match = re.search(r"(?:₺|TL)?\s*(\d{1,4}(?:[.\s]\d{3})*(?:,\d{1,2})|\d{1,5}(?:\.\d{1,2})?)\s*(?:TL|₺)", value, re.I)
+    if not match:
+        match = re.search(r"(\d{1,4}(?:[.\s]\d{3})*(?:,\d{1,2}))", value)
+    if not match:
+        return None
+    number = match.group(1).replace(" ", "")
+    if "," in number:
+        number = number.replace(".", "").replace(",", ".")
+    try:
+        price = float(number)
+    except Exception:
+        return None
+    if price <= 0 or price > 100000:
+        return None
+    return round(price, 2)
+
+
+def format_tl(value) -> str:
+    try:
+        amount = float(value or 0)
+    except Exception:
+        amount = 0
+    return f"{amount:,.2f} TL".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def extract_price_from_text(text: str, source: str = "") -> float | None:
+    text = clean_text(text)
+    source_key = canonical_key(source)
+    patterns = [
+        r"Kitapyurdu Fiyatı\s*:?\s*(?:₺|TL)?\s*([\d.,]+)",
+        r"Kitapseç Fiyatı\s*:?\s*(?:₺|TL)?\s*([\d.,]+)",
+        r"KitapSeç Fiyatı\s*:?\s*(?:₺|TL)?\s*([\d.,]+)",
+        r"Sepette\s*(?:₺|TL)?\s*([\d.,]+)",
+        r"Sepette\s*([\d.,]+)\s*TL",
+        r"İndirimli Fiyat.*?(?:₺|TL)?\s*([\d.,]+)",
+        r"Fiyatı\s*:?\s*(?:₺|TL)?\s*([\d.,]+)",
+        r"Liste Fiyatı\s*:?\s*(?:₺|TL)?\s*([\d.,]+)",
+        r"(?:₺|TL)\s*([\d.,]+)",
+        r"([\d.,]+)\s*(?:TL|₺)",
+    ]
+    prices = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, flags=re.I | re.S):
+            price = parse_turkish_price(match.group(0))
+            if price:
+                prices.append(price)
+    if not prices:
+        return None
+    if any(token in source_key for token in ("kitapyurdu", "kitapsec", "dr", "imge", "bkm", "kitapsepeti")):
+        return min(prices)
+    return min(prices)
 
 
 def is_noise_text(value: str) -> bool:
@@ -413,6 +493,9 @@ def normalize_book_payload(data: dict) -> dict:
     normalized["description"] = clean_text(normalized.get("description"))
     normalized["cover_url"] = clean_text(normalized.get("cover_url"))
     normalized["source_url"] = clean_text(normalized.get("source_url"))
+    normalized["estimated_price"] = normalized.get("estimated_price") or None
+    normalized["estimated_price_source"] = clean_text(normalized.get("estimated_price_source"))
+    normalized["estimated_price_checked_at"] = clean_text(normalized.get("estimated_price_checked_at")) or None
     normalized["category"] = clean_text(normalized.get("category")) or "Kategorisiz"
     normalized["reading_status"] = clean_text(normalized.get("reading_status")) or "Okunacak"
     normalized["favorite"] = bool(normalized.get("favorite"))
@@ -984,6 +1067,13 @@ def record_from_jsonld(obj: dict, variants: list[str], source: str, url: str) ->
     if not title or is_bad_title(title, variants, source):
         return None
 
+    offers = obj.get("offers") or {}
+    if isinstance(offers, list):
+        offers = offers[0] if offers else {}
+    price = None
+    if isinstance(offers, dict):
+        price = parse_turkish_price(clean_text(offers.get("price") or offers.get("lowPrice") or offers.get("highPrice")))
+
     book = blank_book(variants[0])
     book.update(
         {
@@ -993,6 +1083,9 @@ def record_from_jsonld(obj: dict, variants: list[str], source: str, url: str) ->
             "description": clean_text(obj.get("description")),
             "cover_url": image_to_url(obj.get("image")),
             "source_url": url,
+            "estimated_price": price,
+            "estimated_price_source": source if price else "",
+            "estimated_price_checked_at": datetime.now(timezone.utc).isoformat() if price else "",
             "_source": source,
             "_isbn_matched": isbn_matched,
         }
@@ -1259,6 +1352,7 @@ def sanitize_scraped_record(record: dict, variants: list[str], source: str) -> d
 def extract_book_from_html(html: str, variants: list[str], source: str, url: str) -> dict | None:
     soup = BeautifulSoup(html, "html.parser")
     page_text = soup.get_text(" ")
+    page_price = extract_price_from_text(page_text, source)
     page_has_isbn = variant_in_text(variants, page_text)
     lines = [clean_text(line) for line in soup.get_text("\n").splitlines()]
     lines = [line for line in lines if line]
@@ -1318,6 +1412,9 @@ def extract_book_from_html(html: str, variants: list[str], source: str, url: str
             "language": pretty_language(line_value(lines, ["Dil", "Yayın Dili", "Kitap Dili", "Basım Dili"])),
             "cover_url": meta_content(soup, "og:image", "twitter:image"),
             "source_url": url,
+            "estimated_price": page_price,
+            "estimated_price_source": source if page_price else "",
+            "estimated_price_checked_at": datetime.now(timezone.utc).isoformat() if page_price else "",
             "_source": source,
             "_isbn_matched": True,
         }
@@ -1559,6 +1656,11 @@ def merge_records(normalized: dict, records: list[dict]) -> dict | None:
         for field in BOOK_FIELDS:
             if field == "isbn":
                 continue
+            if field == "estimated_price":
+                value = record.get(field)
+                if value and not merged.get(field):
+                    merged[field] = value
+                continue
             value = clean_text(record.get(field))
             if value and not merged.get(field):
                 merged[field] = value
@@ -1689,6 +1791,83 @@ def fetch_library_summary() -> dict:
     return summary
 
 
+def fetch_dashboard_stats() -> dict:
+    rows = []
+    try:
+        response = (
+            supabase.table("books")
+            .select("id,isbn,title,reading_status,page_count,estimated_price")
+            .execute()
+        )
+        rows = response.data or []
+    except Exception:
+        rows = []
+
+    total = len(rows)
+    read_count = sum(1 for row in rows if clean_text(row.get("reading_status")) == "Okundu")
+    unread_pages = 0
+    known_value = 0.0
+    known_value_count = 0
+    missing_price = []
+    for row in rows:
+        if clean_text(row.get("reading_status")) != "Okundu":
+            unread_pages += safe_int(only_digits(row.get("page_count")), 0)
+        price = row.get("estimated_price")
+        if price:
+            try:
+                known_value += float(price)
+                known_value_count += 1
+            except Exception:
+                pass
+        elif clean_text(row.get("isbn")):
+            missing_price.append(row)
+
+    return {
+        "total": total,
+        "read_count": read_count,
+        "read_percent": round((read_count / total) * 100, 1) if total else 0,
+        "unread_pages": unread_pages,
+        "known_value": round(known_value, 2),
+        "known_value_count": known_value_count,
+        "missing_price": missing_price,
+    }
+
+
+def find_price_for_isbn(isbn: str, max_seconds: int = 14) -> tuple[float | None, str]:
+    normalized = normalize_isbn(isbn)
+    if not normalized:
+        return None, ""
+    deadline = time.monotonic() + max_seconds
+    records = []
+    records.extend(search_direct_isbn_pages(normalized["variants"], deadline=deadline))
+    if not deadline_expired(deadline):
+        records.extend(search_turkish_retailers(normalized["variants"], deadline=deadline, link_limit=4))
+    prices = [
+        (record.get("estimated_price"), clean_text(record.get("estimated_price_source") or record.get("_source")))
+        for record in records
+        if record.get("estimated_price")
+    ]
+    if not prices:
+        return None, ""
+    prices = sorted(prices, key=lambda item: float(item[0]))
+    return float(prices[0][0]), prices[0][1]
+
+
+def update_book_estimated_price(book_id, price: float, source: str) -> bool:
+    try:
+        supabase.table("books").update(
+            {
+                "estimated_price": price,
+                "estimated_price_source": source,
+                "estimated_price_checked_at": datetime.now(timezone.utc).isoformat(),
+            }
+        ).eq("id", book_id).execute()
+        return True
+    except Exception as exc:
+        show_schema_error(exc)
+        return False
+
+
 def insert_book(data: dict) -> bool:
     payload = normalize_book_payload(data)
     try:
@@ -1799,6 +1978,151 @@ def delete_pending_isbn(queue_id) -> bool:
         return True
     except Exception as exc:
         st.error(f"Kuyruk kaydı silinemedi: {exc}")
+        return False
+
+
+def fetch_wishlist_items() -> list[dict]:
+    try:
+        response = (
+            supabase.table("wishlist_items")
+            .select("*")
+            .order("priority")
+            .order("created_at", desc=False)
+            .execute()
+        )
+        return response.data or []
+    except Exception:
+        return []
+
+
+def insert_wishlist_item(data: dict) -> bool:
+    payload = {
+        "isbn": clean_text(data.get("isbn")),
+        "title": clean_text(data.get("title")),
+        "author": clean_text(data.get("author")),
+        "publisher": normalize_publisher_name(data.get("publisher")),
+        "cover_url": clean_text(data.get("cover_url")),
+        "priority": safe_int(data.get("priority"), 999),
+        "note": clean_text(data.get("note")),
+    }
+    try:
+        supabase.table("wishlist_items").insert(payload).execute()
+        return True
+    except Exception as exc:
+        show_schema_error(exc)
+        return False
+
+
+def update_wishlist_order(rows: list[dict]) -> bool:
+    try:
+        for row in rows:
+            item_id = row.get("id")
+            if item_id:
+                supabase.table("wishlist_items").update(
+                    {
+                        "priority": safe_int(row.get("priority"), 999),
+                        "note": clean_text(row.get("note")),
+                    }
+                ).eq("id", item_id).execute()
+        return True
+    except Exception as exc:
+        st.error(f"Wishlist sıralaması güncellenemedi: {exc}")
+        return False
+
+
+def delete_wishlist_item(item_id) -> bool:
+    try:
+        supabase.table("wishlist_items").delete().eq("id", item_id).execute()
+        return True
+    except Exception as exc:
+        st.error(f"Wishlist kaydı silinemedi: {exc}")
+        return False
+
+
+def fetch_recommendation_lists() -> list[dict]:
+    try:
+        response = (
+            supabase.table("recommendation_lists")
+            .select("*")
+            .order("person_name")
+            .execute()
+        )
+        return response.data or []
+    except Exception:
+        return []
+
+
+def fetch_recommendation_items(list_id) -> list[dict]:
+    try:
+        response = (
+            supabase.table("recommendation_items")
+            .select("id,book_id,position,note")
+            .eq("list_id", list_id)
+            .order("position")
+            .execute()
+        )
+        items = response.data or []
+        book_ids = [clean_text(item.get("book_id")) for item in items if clean_text(item.get("book_id"))]
+        books_by_id = {}
+        if book_ids:
+            book_response = (
+                supabase.table("books")
+                .select("id,isbn,title,author,cover_url,publisher,page_count,reading_status")
+                .in_("id", book_ids)
+                .execute()
+            )
+            books_by_id = {clean_text(book.get("id")): book for book in (book_response.data or [])}
+        for item in items:
+            item["books"] = books_by_id.get(clean_text(item.get("book_id")), {})
+        return items
+    except Exception:
+        return []
+
+
+def create_recommendation_list(person_name: str) -> bool:
+    try:
+        supabase.table("recommendation_lists").insert({"person_name": clean_text(person_name)}).execute()
+        return True
+    except Exception as exc:
+        show_schema_error(exc)
+        return False
+
+
+def add_recommendation_item(list_id, book_id, position: int) -> bool:
+    try:
+        supabase.table("recommendation_items").upsert(
+            {"list_id": list_id, "book_id": clean_text(book_id), "position": position},
+            on_conflict="list_id,book_id",
+        ).execute()
+        return True
+    except Exception as exc:
+        show_schema_error(exc)
+        return False
+
+
+def update_recommendation_items(rows: list[dict]) -> bool:
+    try:
+        for row in rows:
+            item_id = row.get("id")
+            if item_id:
+                supabase.table("recommendation_items").update(
+                    {
+                        "position": safe_int(row.get("position"), 999),
+                        "note": clean_text(row.get("note")),
+                    }
+                ).eq("id", item_id).execute()
+        return True
+    except Exception as exc:
+        st.error(f"Tavsiye sıralaması güncellenemedi: {exc}")
+        return False
+
+
+def delete_recommendation_item(item_id) -> bool:
+    try:
+        supabase.table("recommendation_items").delete().eq("id", item_id).execute()
+        return True
+    except Exception as exc:
+        st.error(f"Tavsiye kaydı silinemedi: {exc}")
         return False
 
 
@@ -2022,13 +2346,13 @@ def render_top_bar():
 def render_sidebar(all_books: list[dict] | None = None):
     st.sidebar.title(f"📚 {APP_NAME}")
 
-    current = st.session_state.get("page", "add")
+    current = st.session_state.get("page", "home")
     labels = list(PAGE_LABELS.values())
     reverse_labels = {value: key for key, value in PAGE_LABELS.items()}
     selected_label = st.sidebar.radio(
         "Menü",
         labels,
-        index=labels.index(PAGE_LABELS.get(current, PAGE_LABELS["add"])),
+        index=labels.index(PAGE_LABELS.get(current, PAGE_LABELS["home"])),
     )
     selected_page = reverse_labels[selected_label]
     st.session_state["page"] = selected_page
@@ -2401,6 +2725,264 @@ def render_quick_search_page(book_index: list[dict]):
     ]
     st.dataframe(rows, use_container_width=True, hide_index=True)
     st.caption(f"Gösterilen kayıt: {len(preview)}")
+
+
+def render_home_page():
+    st.header("Ana Ekran")
+    stats = fetch_dashboard_stats()
+    total = stats["total"]
+    read_count = stats["read_count"]
+    unread_pages = stats["unread_pages"]
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Toplam Kitap", total)
+    col2.metric("Okunan Kitap", read_count)
+    col3.metric("Okuma Oranı", f"%{stats['read_percent']}")
+    col4.metric("Kalan Sayfa", unread_pages)
+
+    st.subheader("Kalan Kitaplar Ne Zaman Biter?")
+    daily_pages = st.number_input("Günde kaç sayfa okuyacaksın?", min_value=1, max_value=2000, value=100, step=10)
+    days = (unread_pages + daily_pages - 1) // daily_pages if daily_pages else 0
+    st.info(f"Günde {daily_pages} sayfa okursan kalan sayfalar yaklaşık {days} günde biter.")
+
+    st.subheader("Tahmini Kütüphane Değeri")
+    known_value_text = format_tl(stats["known_value"])
+    st.write(f"Şu anda fiyatı bilinen {stats['known_value_count']} kitap için tahmini değer: **{known_value_text}**")
+    scan_limit = st.number_input(
+        "Bu sefer en fazla kaç eksik fiyat taransın?",
+        min_value=1,
+        max_value=500,
+        value=min(30, max(1, len(stats["missing_price"]))),
+        step=5,
+    )
+    if st.button("Tahmini kütüphane değerini belirle", type="primary", use_container_width=True):
+        missing = stats["missing_price"][:scan_limit]
+        if not missing:
+            st.success("Fiyatı eksik kitap görünmüyor.")
+            return
+        progress = st.progress(0)
+        found_value = 0.0
+        found_count = 0
+        for index, book in enumerate(missing, start=1):
+            progress.progress(index / len(missing))
+            price, source = find_price_for_isbn(book.get("isbn"), max_seconds=12)
+            if price and update_book_estimated_price(book["id"], price, source):
+                found_value += price
+                found_count += 1
+        st.success(f"{found_count} kitap için fiyat bulundu. Bu tur bulunan değer: {format_tl(found_value)}")
+        st.info("Toplam değerin güncel halini görmek için sayfayı yenileyebilirsin.")
+
+
+def render_wishlist_page():
+    st.header("Wishlist")
+    st.caption("Satın almak veya edinmek istediğin kitapları barkodla ya da elle ekleyebilirsin.")
+
+    with st.expander("Wishlist'e Kitap Ekle", expanded=True):
+        c1, c2 = st.columns(2)
+        with c1:
+            img_file = st.camera_input("Barkod okut", key="wishlist_camera")
+            upload = st.file_uploader("Barkod fotoğrafı yükle", type=["png", "jpg", "jpeg"], key="wishlist_upload")
+        with c2:
+            isbn_input = st.text_input("ISBN", key="wishlist_isbn")
+            manual_title = st.text_input("Manuel kitap adı", key="wishlist_manual_title")
+            manual_author = st.text_input("Manuel yazar", key="wishlist_manual_author")
+            note = st.text_input("Not", key="wishlist_note")
+
+        isbn = isbn_input.strip() if isbn_input else ""
+        decoded = decode_isbn_from_image(img_file) or decode_isbn_from_image(upload)
+        if decoded:
+            isbn = decoded
+            st.success(f"Barkod okundu: {isbn}")
+
+        if st.button("Wishlist'e Ekle", use_container_width=True):
+            book = blank_book(normalize_lookup_isbn(isbn))
+            if isbn:
+                lookup = get_book_info_comprehensive(isbn, max_seconds=20, web_result_limit=4, retailer_link_limit=4)
+                if lookup.get("book"):
+                    book.update(lookup["book"])
+            if manual_title:
+                book["title"] = manual_title
+            if manual_author:
+                book["author"] = manual_author
+            book["note"] = note
+            current_count = len(fetch_wishlist_items())
+            book["priority"] = current_count + 1
+            if not clean_text(book.get("title")):
+                st.error("Wishlist için kitap adı ya da bulunabilir ISBN gerekli.")
+            elif insert_wishlist_item(book):
+                st.success("Wishlist'e eklendi.")
+                st.rerun()
+
+    items = fetch_wishlist_items()
+    if not items:
+        st.info("Wishlist boş.")
+        return
+
+    rows = [
+        {
+            "id": item.get("id"),
+            "priority": item.get("priority") or index,
+            "title": item.get("title"),
+            "author": item.get("author"),
+            "isbn": item.get("isbn"),
+            "note": item.get("note"),
+        }
+        for index, item in enumerate(items, start=1)
+    ]
+    edited = st.data_editor(
+        rows,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "id": None,
+            "priority": st.column_config.NumberColumn("Sıra", min_value=1, step=1),
+            "title": st.column_config.TextColumn("Kitap"),
+            "author": st.column_config.TextColumn("Yazar"),
+            "isbn": st.column_config.TextColumn("ISBN"),
+            "note": st.column_config.TextColumn("Not"),
+        },
+        key="wishlist_editor",
+    )
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Wishlist sırasını kaydet", use_container_width=True):
+            if update_wishlist_order(editor_rows_to_list(edited)):
+                st.success("Wishlist güncellendi.")
+                st.rerun()
+    with c2:
+        delete_id = st.selectbox("Silinecek kayıt", [""] + [f"{item['id']} · {item['title']}" for item in items])
+        if st.button("Seçili wishlist kaydını sil", use_container_width=True) and delete_id:
+            if delete_wishlist_item(delete_id.split(" · ")[0]):
+                st.success("Wishlist kaydı silindi.")
+                st.rerun()
+
+
+def render_recommendations_page(book_index: list[dict]):
+    st.header("Tavsiyeler")
+    st.caption("Kişiye özel okuma tavsiye listeleri oluştur.")
+
+    with st.form("create_recommendation_list"):
+        person_name = st.text_input("Kime tavsiye edeceksin?")
+        create_submit = st.form_submit_button("Yeni Tavsiye Listesi Oluştur")
+    if create_submit and person_name:
+        if create_recommendation_list(person_name):
+            st.success("Tavsiye listesi oluşturuldu.")
+            st.rerun()
+
+    lists = fetch_recommendation_lists()
+    if not lists:
+        st.info("Henüz tavsiye listesi yok.")
+        return
+
+    selected = st.selectbox("Tavsiye listesi", lists, format_func=lambda row: row.get("person_name", "İsimsiz"))
+    list_id = selected.get("id")
+    labels = {
+        f"{book.get('title')} - {book.get('author', '')} [{book.get('isbn', '')}]": book
+        for book in book_index
+        if clean_text(book.get("title"))
+    }
+    picks = st.multiselect("Bu listeye kitap ekle", list(labels.keys()))
+    if st.button("Seçili kitapları tavsiye listesine ekle", use_container_width=True):
+        current_count = len(fetch_recommendation_items(list_id))
+        added = 0
+        for offset, label in enumerate(picks, start=1):
+            if add_recommendation_item(list_id, labels[label]["id"], current_count + offset):
+                added += 1
+        st.success(f"{added} kitap tavsiye listesine eklendi.")
+        st.rerun()
+
+    items = fetch_recommendation_items(list_id)
+    if not items:
+        st.info("Bu listede henüz kitap yok.")
+        return
+
+    rows = []
+    for item in items:
+        book = item.get("books") or {}
+        rows.append(
+            {
+                "id": item.get("id"),
+                "position": item.get("position") or 999,
+                "title": book.get("title"),
+                "author": book.get("author"),
+                "note": item.get("note"),
+            }
+        )
+    edited = st.data_editor(
+        rows,
+        use_container_width=True,
+        hide_index=True,
+        key="recommendation_items_editor",
+        column_config={
+            "id": None,
+            "position": st.column_config.NumberColumn("Okuma Sırası", min_value=1, step=1),
+            "title": st.column_config.TextColumn("Kitap", disabled=True),
+            "author": st.column_config.TextColumn("Yazar", disabled=True),
+            "note": st.column_config.TextColumn("Not"),
+        },
+    )
+    if st.button("Tavsiye sırasını kaydet", use_container_width=True):
+        if update_recommendation_items(editor_rows_to_list(edited)):
+            st.success("Tavsiye listesi güncellendi.")
+            st.rerun()
+
+    st.subheader("Detay")
+    for item in items:
+        book = item.get("books") or {}
+        with st.expander(f"{book.get('title')} - {book.get('author', '')}"):
+            if book.get("cover_url"):
+                st.image(book["cover_url"], width=120)
+            st.write(f"**ISBN:** {book.get('isbn') or '-'}")
+            st.write(f"**Yayınevi:** {book.get('publisher') or '-'}")
+            st.write(f"**Sayfa:** {book.get('page_count') or '-'}")
+
+
+def new_game_question(book_index: list[dict], mode: str) -> dict | None:
+    candidates = [book for book in book_index if clean_text(book.get("title")) and clean_text(book.get("author"))]
+    if len(candidates) < 4:
+        return None
+    answer_book = random.choice(candidates)
+    if mode == "Kitap adından yazarı bul":
+        correct = clean_text(answer_book.get("author"))
+        pool = unique_keep_order([clean_text(book.get("author")) for book in candidates if clean_text(book.get("author"))])
+        prompt = f"'{answer_book.get('title')}' kitabının yazarı kim?"
+    else:
+        correct = clean_text(answer_book.get("title"))
+        pool = unique_keep_order([clean_text(book.get("title")) for book in candidates if clean_text(book.get("title"))])
+        prompt = f"{answer_book.get('author')} hangi kitabın yazarı?"
+    wrongs = [item for item in pool if item != correct]
+    choices = random.sample(wrongs, k=min(3, len(wrongs))) + [correct]
+    random.shuffle(choices)
+    return {"prompt": prompt, "correct": correct, "choices": choices}
+
+
+def render_game_page(book_index: list[dict]):
+    st.header("Oyun Oyna")
+    st.caption("Kitap adı-yazar eşleştirme oyunu.")
+    st.session_state.setdefault("game_score", 0)
+    st.session_state.setdefault("game_total", 0)
+    mode = st.radio("Oyun modu", ["Kitap adından yazarı bul", "Yazardan kitabı bul"], horizontal=True)
+
+    if st.button("Yeni Soru", use_container_width=True):
+        st.session_state["game_question"] = new_game_question(book_index, mode)
+
+    question = st.session_state.get("game_question") or new_game_question(book_index, mode)
+    st.session_state["game_question"] = question
+    if not question:
+        st.warning("Oyun için en az 4 kitapta hem kitap adı hem yazar olmalı.")
+        return
+
+    st.subheader(question["prompt"])
+    answer = st.radio("Cevabın", question["choices"], key=f"game_answer_{st.session_state.get('game_total', 0)}")
+    if st.button("Cevabı Kontrol Et", type="primary", use_container_width=True):
+        st.session_state["game_total"] += 1
+        if answer == question["correct"]:
+            st.session_state["game_score"] += 1
+            st.success("Doğru!")
+        else:
+            st.error(f"Yanlış. Doğru cevap: {question['correct']}")
+        st.session_state["game_question"] = new_game_question(book_index, mode)
+    st.metric("Puan", f"{st.session_state['game_score']} / {st.session_state['game_total']}")
 
 
 def blank_bulk_rows(count: int = 25) -> list[dict]:
@@ -3141,6 +3723,32 @@ def render_lookup_queue_page():
         st.info("Sonra aranacak ISBN yok.")
         return
 
+    if st.button("Tüm Bekleyenleri Kitap Sitelerinde Güçlü Ara", type="primary", use_container_width=True):
+        searchable = [item for item in pending_items if clean_text(item.get("status")) in {"bekliyor", "bulunamadı", ""}]
+        if not searchable:
+            st.info("Aranacak bekleyen ISBN yok.")
+            return
+        progress = st.progress(0)
+        found = 0
+        for index, item in enumerate(searchable, start=1):
+            isbn = clean_text(item.get("isbn"))
+            progress.progress(index / len(searchable))
+            lookup = get_book_info_comprehensive(
+                isbn,
+                cache_version=LOOKUP_CACHE_VERSION + 2,
+                max_seconds=25,
+                web_result_limit=6,
+                retailer_link_limit=8,
+            )
+            if lookup.get("ok") and lookup.get("book", {}).get("title"):
+                st.session_state[f"queue_result_{item.get('id')}"] = lookup["book"]
+                update_pending_isbn_status(item.get("id"), "bulundu")
+                found += 1
+            else:
+                update_pending_isbn_status(item.get("id"), "bulunamadı")
+        st.success(f"Güçlü arama tamamlandı. {found} kitap için bilgi bulundu.")
+        st.rerun()
+
     for item in pending_items:
         queue_id = item.get("id")
         isbn = clean_text(item.get("isbn"))
@@ -3199,7 +3807,7 @@ def render_lookup_queue_page():
 inject_css()
 
 if "page" not in st.session_state:
-    st.session_state["page"] = "add"
+    st.session_state["page"] = "home"
 if "add_nonce" not in st.session_state:
     st.session_state["add_nonce"] = 0
 
@@ -3208,7 +3816,9 @@ filters = render_sidebar()
 all_books = filters[5]
 render_top_bar()
 
-if st.session_state.get("page") == "add":
+if st.session_state.get("page") == "home":
+    render_home_page()
+elif st.session_state.get("page") == "add":
     render_add_page()
 elif st.session_state.get("page") == "quick_search":
     render_quick_search_page(book_index)
@@ -3216,5 +3826,11 @@ elif st.session_state.get("page") == "bulk_add":
     render_bulk_add_page()
 elif st.session_state.get("page") == "lookup_queue":
     render_lookup_queue_page()
+elif st.session_state.get("page") == "wishlist":
+    render_wishlist_page()
+elif st.session_state.get("page") == "recommendations":
+    render_recommendations_page(book_index)
+elif st.session_state.get("page") == "game":
+    render_game_page(book_index)
 else:
     render_library_page(all_books, filters[:5])
