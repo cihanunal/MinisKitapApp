@@ -2285,6 +2285,17 @@ def fetch_book_by_id(book_id) -> dict | None:
 
 
 def fetch_library_summary() -> dict:
+    static_books = load_static_library_books()
+    if static_books:
+        return {
+            "count": len(static_books),
+            "recent": sorted(
+                static_books,
+                key=lambda row: clean_text(row.get("created_at") or row.get("updated_at")),
+                reverse=True,
+            )[:2],
+        }
+
     summary = {"count": 0, "recent": []}
     try:
         count_response = supabase.table("books").select("id", count="exact").limit(1).execute()
@@ -2307,16 +2318,17 @@ def fetch_library_summary() -> dict:
 
 
 def fetch_dashboard_stats() -> dict:
-    rows = []
-    try:
-        response = (
-            supabase.table("books")
-            .select("id,isbn,title,reading_status,page_count,estimated_price")
-            .execute()
-        )
-        rows = response.data or []
-    except Exception:
-        rows = []
+    rows = load_static_library_books()
+    if not rows:
+        try:
+            response = (
+                supabase.table("books")
+                .select("id,isbn,title,reading_status,page_count,estimated_price")
+                .execute()
+            )
+            rows = response.data or []
+        except Exception:
+            rows = []
 
     total = len(rows)
     read_count = sum(1 for row in rows if clean_text(row.get("reading_status")) == "Okundu")
@@ -4358,7 +4370,8 @@ def render_bulk_add_page():
 
 def render_library_page(all_books: list[dict], filters: tuple):
     personal_filter, status_filter, tag_filter, search_term, sort_by = filters
-    st.header("Kitaplığım")
+    st.header("Detaylı Kütüphanem")
+    render_static_library_package_controls()
 
     filtered = filter_books(all_books, search_term, personal_filter, status_filter, tag_filter)
     books = sort_books(filtered, sort_by)
@@ -4384,6 +4397,46 @@ def render_library_page(all_books: list[dict], filters: tuple):
                 render_book_editor(book)
 
 
+def render_manual_book_add_section(add_nonce: int):
+    with st.expander("Elle Kitap Ekle", expanded=False):
+        st.caption("ISBN dahil tüm bilgileri kendin girip internet araması yapmadan doğrudan kütüphaneye kaydedebilirsin.")
+        with st.form(f"manual_book_form_{add_nonce}"):
+            manual_isbn = st.text_input(
+                "ISBN",
+                placeholder="9786052361917",
+                key=f"manual_book_isbn_{add_nonce}",
+            )
+            manual_data = build_form_data(
+                f"manual_book_{add_nonce}",
+                blank_book(normalize_lookup_isbn(manual_isbn) if manual_isbn else ""),
+            )
+            submitted = st.form_submit_button(
+                "Elle Girilen Kitabı Kütüphaneye Kaydet",
+                type="primary",
+                use_container_width=True,
+            )
+
+        if not submitted:
+            return
+
+        manual_data["isbn"] = normalize_lookup_isbn(manual_isbn) if manual_isbn else ""
+        if not clean_text(manual_data.get("title")):
+            st.error("Kitap adı zorunlu.")
+            return
+
+        if manual_data.get("isbn"):
+            existing = isbn_exists(manual_data.get("isbn"))
+            if existing:
+                st.warning(f"Bu ISBN zaten kayıtlı: {existing.get('title', 'İsimsiz')}")
+                return
+
+        if insert_book(manual_data):
+            st.session_state["last_add_success"] = f"'{clean_text(manual_data['title'])}' elle kütüphaneye eklendi."
+            set_page("add")
+            st.session_state["add_nonce"] = add_nonce + 1
+            st.rerun()
+
+
 def render_add_page():
     st.header("Yeni Kitap Ekle")
     add_nonce = st.session_state.get("add_nonce", 0)
@@ -4406,6 +4459,9 @@ def render_add_page():
                 st.write(f"• {clean_text(book.get('title'))}{suffix}")
         else:
             st.caption("Henüz kitap eklenmemiş.")
+
+    render_manual_book_add_section(add_nonce)
+    st.divider()
 
     camera_col, manual_col = st.columns([0.48, 0.52])
     with camera_col:
