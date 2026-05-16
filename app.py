@@ -1158,6 +1158,32 @@ def schema_additional_properties(obj: dict) -> dict:
     return mapped
 
 
+def jsonld_offer_price(obj: dict) -> float | None:
+    offers = obj.get("offers") or obj.get("offer") or {}
+    if isinstance(offers, list):
+        offer_items = offers
+    else:
+        offer_items = [offers]
+
+    for offer in offer_items:
+        if not isinstance(offer, dict):
+            continue
+        for key in ("price", "lowPrice", "highPrice"):
+            price = parse_turkish_price(clean_text(offer.get(key)))
+            if price:
+                return price
+    return None
+
+
+def extract_price_from_soup(soup: BeautifulSoup, source: str = "") -> float | None:
+    for obj in jsonld_objects(soup):
+        if isinstance(obj, dict):
+            price = jsonld_offer_price(obj)
+            if price:
+                return price
+    return extract_price_from_text(soup.get_text(" "), source)
+
+
 def record_from_jsonld(obj: dict, variants: list[str], source: str, url: str) -> dict | None:
     type_value = obj.get("@type", "")
     type_text = " ".join(type_value) if isinstance(type_value, list) else str(type_value)
@@ -1183,12 +1209,7 @@ def record_from_jsonld(obj: dict, variants: list[str], source: str, url: str) ->
     if not title or is_bad_title(title, variants, source):
         return None
 
-    offers = obj.get("offers") or {}
-    if isinstance(offers, list):
-        offers = offers[0] if offers else {}
-    price = None
-    if isinstance(offers, dict):
-        price = parse_turkish_price(clean_text(offers.get("price") or offers.get("lowPrice") or offers.get("highPrice")))
+    price = jsonld_offer_price(obj)
 
     book = blank_book(variants[0])
     book.update(
@@ -1536,7 +1557,7 @@ def record_from_kitapsec_html(soup: BeautifulSoup, variants: list[str], source: 
     if cover_url:
         cover_url = urljoin(url, cover_url)
 
-    price = extract_price_from_text(page_text, source)
+    price = extract_price_from_soup(soup, source)
 
     book = blank_book(variants[0])
     book.update(
@@ -1573,7 +1594,7 @@ def extract_book_from_html(html: str, variants: list[str], source: str, url: str
             return kitapsec_record
 
     page_text = soup.get_text(" ")
-    page_price = extract_price_from_text(page_text, source)
+    page_price = extract_price_from_soup(soup, source)
     page_has_isbn = variant_in_text(variants, page_text)
     lines = [clean_text(line) for line in soup.get_text("\n").splitlines()]
     lines = [line for line in lines if line]
@@ -1792,6 +1813,60 @@ def search_specific_retailer(
         if records:
             break
     return records
+
+
+def find_prices_specific_retailer(
+    variants: list[str],
+    source: str,
+    template: str,
+    deadline: float | None = None,
+    link_limit: int = 8,
+) -> list[tuple[float, str]]:
+    prices = []
+    seen_links = set()
+    search_templates = unique_keep_order([template, *SITE_EXTRA_SEARCH_TEMPLATES.get(source, [])])
+
+    for isbn in variants:
+        if deadline_expired(deadline):
+            break
+        for search_template in search_templates:
+            if deadline_expired(deadline):
+                break
+
+            final_url, html = http_get_html(search_template.format(isbn=isbn), deadline=deadline)
+            if not html:
+                continue
+
+            soup = BeautifulSoup(html, "html.parser")
+            title_hint = clean_text(soup.title.get_text(" ") if soup.title else "")
+            if variant_in_text(variants, html) and not looks_like_search_page(final_url, title_hint):
+                price = extract_price_from_soup(soup, source)
+                if price:
+                    prices.append((price, source))
+                    return prices
+
+            product_links = []
+            if "kitapsec" in canonical_key(source):
+                product_links = kitapsec_product_links(soup, final_url, variants)
+            if not product_links:
+                product_links = candidate_product_links(soup, final_url, variants)
+
+            for link in product_links[:link_limit]:
+                if deadline_expired(deadline):
+                    break
+                if link in seen_links:
+                    continue
+                seen_links.add(link)
+
+                product_url, product_html = http_get_html(link, deadline=deadline)
+                if not product_html or not variant_in_text(variants, product_html):
+                    continue
+                product_soup = BeautifulSoup(product_html, "html.parser")
+                price = extract_price_from_soup(product_soup, source)
+                if price:
+                    prices.append((price, source))
+                    return prices
+    return prices
 
 
 def search_turkish_retailers(
@@ -2227,19 +2302,39 @@ def find_price_for_isbn(isbn: str, max_seconds: int = 14) -> tuple[float | None,
     if not normalized:
         return None, ""
     deadline = time.monotonic() + max_seconds
+    prices = []
+
+    for retailer_key in ("kitapsec", "kitapyurdu"):
+        if deadline_expired(deadline):
+            break
+        source, template = SITE_SPECIFIC_RETAILERS[retailer_key]
+        prices.extend(
+            find_prices_specific_retailer(
+                normalized["variants"],
+                source,
+                template,
+                deadline=deadline,
+                link_limit=8,
+            )
+        )
+
+    if prices:
+        prices = sorted(prices, key=lambda item: float(item[0]))
+        return float(prices[0][0]), prices[0][1]
+
     records = []
     records.extend(search_direct_isbn_pages(normalized["variants"], deadline=deadline))
     if not deadline_expired(deadline):
         records.extend(search_turkish_retailers(normalized["variants"], deadline=deadline, link_limit=4))
-    prices = [
+    record_prices = [
         (record.get("estimated_price"), clean_text(record.get("estimated_price_source") or record.get("_source")))
         for record in records
         if record.get("estimated_price")
     ]
-    if not prices:
+    if not record_prices:
         return None, ""
-    prices = sorted(prices, key=lambda item: float(item[0]))
-    return float(prices[0][0]), prices[0][1]
+    record_prices = sorted(record_prices, key=lambda item: float(item[0]))
+    return float(record_prices[0][0]), record_prices[0][1]
 
 
 def update_book_estimated_price(book_id, price: float, source: str) -> bool:
@@ -3028,8 +3123,10 @@ def build_form_data(prefix: str, initial: dict) -> dict:
 
 
 def kitapsec_update_payload(current: dict, fetched: dict) -> dict:
-    payload = dict(current)
-    payload["isbn"] = clean_text(current.get("isbn")) or clean_text(fetched.get("isbn"))
+    payload = blank_book(clean_text(current.get("isbn")) or clean_text(fetched.get("isbn")))
+    for field in SAVE_FIELDS:
+        if field in current:
+            payload[field] = current.get(field)
 
     for field in BOOK_FIELDS:
         if field == "isbn":
@@ -3041,7 +3138,8 @@ def kitapsec_update_payload(current: dict, fetched: dict) -> dict:
             continue
 
         value = clean_text(fetched.get(field))
-        if value:
+        bad_values = {"bulunamadi", "bulunamadi.", "bulunamadı", "yok", "none", "null"}
+        if value and canonical_key(value) not in bad_values:
             payload[field] = value
 
     for field in ("category", "reading_status", "favorite", "tags", "notes", "loaned_to", "rating"):
@@ -3141,6 +3239,82 @@ def render_kitapsec_update_controls(book: dict):
             st.session_state.pop(error_key, None)
             st.info("Güncelleme yapılmadı.")
             st.rerun()
+
+
+def update_single_book_from_kitapsec(book: dict, max_seconds: int = 18) -> tuple[str, str]:
+    isbn = clean_text(book.get("isbn"))
+    if not isbn:
+        return "skipped", f"{book_title(book)}: ISBN yok"
+
+    lookup = lookup_specific_retailer(isbn, "kitapsec", max_seconds=max_seconds, link_limit=12)
+    if not lookup.get("ok") or not lookup.get("book", {}).get("title"):
+        return "not_found", f"{isbn}: Kitapseç kaydı bulunamadı"
+
+    payload = kitapsec_update_payload(book, lookup["book"])
+    if update_book(book.get("id"), payload):
+        return "updated", f"{isbn}: {clean_text(payload.get('title')) or book_title(book)}"
+    return "error", f"{isbn}: güncelleme kaydedilemedi"
+
+
+def render_library_kitapsec_bulk_controls(all_books: list[dict], visible_books: list[dict]):
+    last_result = st.session_state.pop("library_kitapsec_bulk_result", None)
+    if last_result:
+        st.success(
+            f"{last_result['label']} tamamlandı. "
+            f"Güncellenen: {last_result['updated']} · "
+            f"Bulunamayan: {last_result['not_found']} · "
+            f"Atlanan: {last_result['skipped']} · "
+            f"Hata: {last_result['error']}"
+        )
+        if last_result.get("examples"):
+            with st.expander("Son işlem özeti"):
+                for item in last_result["examples"][:30]:
+                    st.write(f"- {item}")
+
+    st.subheader("Toplu Kitapseç Güncelleme")
+    st.caption("Kitapseç boş bilgi döndürürse mevcut dolu alanlar korunur; okuma durumu, kategori, not, etiket ve puan değişmez.")
+
+    update_visible, update_all = st.columns(2)
+    with update_visible:
+        if st.button(
+            f"Görünen {len(visible_books)} Kitabı Kitapseç'ten Güncelle",
+            use_container_width=True,
+            disabled=not visible_books,
+            key="kitapsec_bulk_visible",
+        ):
+            run_library_kitapsec_bulk_update(visible_books, "Görünen kitaplar")
+    with update_all:
+        if st.button(
+            f"Tüm {len(all_books)} Kitabı Kitapseç'ten Güncelle",
+            use_container_width=True,
+            disabled=not all_books,
+            key="kitapsec_bulk_all",
+        ):
+            run_library_kitapsec_bulk_update(all_books, "Tüm kütüphane")
+
+
+def run_library_kitapsec_bulk_update(target_books: list[dict], label: str):
+    books_with_isbn = [book for book in target_books if clean_text(book.get("isbn"))]
+    if not books_with_isbn:
+        st.warning("Güncellenecek ISBN'li kitap yok.")
+        return
+
+    progress = st.progress(0)
+    status_box = st.empty()
+    result = {"label": label, "updated": 0, "not_found": 0, "skipped": 0, "error": 0, "examples": []}
+
+    for index, book in enumerate(books_with_isbn, start=1):
+        isbn = clean_text(book.get("isbn"))
+        progress.progress(index / len(books_with_isbn))
+        status_box.info(f"{index}/{len(books_with_isbn)} Kitapseç'ten güncelleniyor: {isbn}")
+        status, message = update_single_book_from_kitapsec(book, max_seconds=18)
+        result[status] = result.get(status, 0) + 1
+        if len(result["examples"]) < 30:
+            result["examples"].append(message)
+
+    status_box.success("Toplu Kitapseç güncellemesi tamamlandı.")
+    st.session_state["library_kitapsec_bulk_result"] = result
+    st.rerun()
 
 
 def render_book_details(book: dict):
@@ -4056,6 +4230,7 @@ def render_library_page(all_books: list[dict], filters: tuple):
 
     total = len(all_books)
     st.caption(f"{len(books)} kitap gösteriliyor · toplam {total} kitap")
+    render_library_kitapsec_bulk_controls(all_books, books)
 
     if not books:
         st.info("Bu filtrelerde kitap bulunamadı.")
