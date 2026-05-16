@@ -3438,12 +3438,33 @@ def build_form_data(prefix: str, initial: dict) -> dict:
     }
 
 
+def is_usable_kitapsec_update_value(field: str, value) -> bool:
+    value_text = clean_text(value)
+    if not value_text:
+        return False
+    bad_values = {
+        "bulunamadi",
+        "bulunamadı",
+        "yok",
+        "none",
+        "null",
+        "belirtilmemis",
+        "belirtilmemiş",
+        "-",
+    }
+    if canonical_key(value_text) in bad_values:
+        return False
+    if field == "page_count" and not only_digits(value_text):
+        return False
+    if field == "first_print_year" and not first_year(value_text):
+        return False
+    return True
+
+
 def kitapsec_update_payload(current: dict, fetched: dict) -> dict:
-    payload = blank_book(clean_text(current.get("isbn")) or clean_text(fetched.get("isbn")))
-    for field in SAVE_FIELDS:
-        if field in current:
-            payload[field] = current.get(field)
-    bad_values = {"bulunamadi", "bulunamadı", "yok", "none", "null"}
+    payload = {field: current.get(field) for field in SAVE_FIELDS if field in current}
+    payload["isbn"] = clean_text(current.get("isbn")) or clean_text(fetched.get("isbn"))
+
     for field in BOOK_FIELDS:
         if field == "isbn":
             continue
@@ -3452,9 +3473,9 @@ def kitapsec_update_payload(current: dict, fetched: dict) -> dict:
             if value not in ("", None):
                 payload[field] = value
             continue
-        value = clean_text(fetched.get(field))
-        if value and canonical_key(value) not in bad_values:
-            payload[field] = value
+        value = fetched.get(field)
+        if is_usable_kitapsec_update_value(field, value):
+            payload[field] = clean_text(value)
     for field in ("category", "reading_status", "favorite", "tags", "notes", "loaned_to", "rating"):
         payload[field] = current.get(field)
     return payload
@@ -3533,7 +3554,8 @@ def render_kitapsec_update_controls(book: dict):
     confirm_col, cancel_col = st.columns(2)
     with confirm_col:
         if st.button("Evet, Bu Bilgilerle Güncelle", type="primary", key=f"kitapsec_confirm_{book_id}", use_container_width=True):
-            if update_book(book.get("id"), kitapsec_update_payload(book, fetched)):
+            current_book = fetch_book_detail_for_display(book)
+            if update_book(current_book.get("id") or book.get("id"), kitapsec_update_payload(current_book, fetched)):
                 st.session_state.pop(result_key, None)
                 st.session_state.pop(error_key, None)
                 st.success("Kitap Kitapseç bilgileriyle güncellendi.")
@@ -3553,8 +3575,9 @@ def update_single_book_from_kitapsec(book: dict, max_seconds: int = 18) -> tuple
     lookup = lookup_specific_retailer(isbn, "kitapsec", max_seconds=max_seconds, link_limit=12)
     if not lookup.get("ok") or not lookup.get("book", {}).get("title"):
         return "not_found", f"{isbn}: Kitapseç kaydı bulunamadı"
-    payload = kitapsec_update_payload(book, lookup["book"])
-    if update_book(book.get("id"), payload):
+    current_book = fetch_book_detail_for_display(book)
+    payload = kitapsec_update_payload(current_book, lookup["book"])
+    if update_book(current_book.get("id") or book.get("id"), payload):
         return "updated", f"{isbn}: {clean_text(payload.get('title')) or book_title(book)}"
     return "error", f"{isbn}: güncelleme kaydedilemedi"
 
