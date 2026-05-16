@@ -5016,16 +5016,43 @@ def render_lookup_queue_page():
                         st.success("Kitap bulundu. Aşağıdan kontrol edip ekleyebilirsin.")
                     else:
                         update_pending_isbn_status(queue_id, "bulunamadı")
-                        st.warning("Uygulama güvenilir kayıt bulamadı. İstersen elle eklemeye gönderebilirsin.")
+                        st.warning("Uygulama güvenilir kayıt bulamadı. İstersen detayları elle ekleyebilirsin.")
             with action_col4:
-                if st.button("Elle Eklemeye Gönder", key=f"queue_manual_{queue_id}", use_container_width=True):
-                    st.session_state["bulk_prefill_isbn"] = isbn
-                    set_page("bulk_add")
+                if st.button("Detayları Elle Ekle", key=f"queue_manual_{queue_id}", use_container_width=True):
+                    st.session_state[f"queue_manual_form_{queue_id}"] = True
                     st.rerun()
             with action_col5:
                 if st.button("Listeden Sil", key=f"queue_delete_{queue_id}", use_container_width=True):
                     if delete_pending_isbn(queue_id):
                         st.success("ISBN listeden silindi.")
+                        st.rerun()
+
+            if st.session_state.get(f"queue_manual_form_{queue_id}"):
+                st.info("ISBN sabit kalacak; diğer kitap bilgilerini elle doldurup doğrudan kütüphaneye ekleyebilirsin.")
+                manual_initial = blank_book(normalize_lookup_isbn(isbn))
+                close_col, _ = st.columns([0.25, 0.75])
+                with close_col:
+                    if st.button("Manuel Formu Kapat", key=f"queue_manual_close_{queue_id}", use_container_width=True):
+                        st.session_state.pop(f"queue_manual_form_{queue_id}", None)
+                        st.rerun()
+
+                with st.form(f"queue_manual_add_form_{queue_id}"):
+                    st.write(f"**ISBN:** {normalize_lookup_isbn(isbn)}")
+                    data = build_form_data(f"queue_manual_{queue_id}", manual_initial)
+                    data["isbn"] = normalize_lookup_isbn(isbn)
+                    submitted = st.form_submit_button("Elle Girilen Kitabı Kütüphaneye Ekle", type="primary", use_container_width=True)
+
+                if submitted:
+                    if not clean_text(data.get("title")):
+                        st.error("Kitap adı zorunlu.")
+                    elif isbn_exists(data.get("isbn")):
+                        st.warning("Bu ISBN zaten kütüphanede kayıtlı.")
+                    elif insert_book(data):
+                        update_pending_isbn_status(queue_id, "eklendi")
+                        delete_pending_isbn(queue_id)
+                        st.session_state.pop(f"queue_manual_form_{queue_id}", None)
+                        st.session_state.pop(f"queue_result_{queue_id}", None)
+                        st.success("Kitap elle kütüphaneye eklendi ve kuyruktan kaldırıldı.")
                         st.rerun()
 
             result = st.session_state.get(f"queue_result_{queue_id}")
