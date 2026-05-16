@@ -575,12 +575,31 @@ def resolve_static_cover_path(value: str) -> str:
     value = clean_text(value)
     if not value:
         return ""
+    if value.startswith("zip://"):
+        return extract_static_zip_cover(value.removeprefix("zip://"))
     if value.startswith(("http://", "https://", "data:")):
         return value
     path = Path(value)
     if not path.is_absolute():
         path = APP_DIR / value
     return str(path) if path.exists() else value
+
+
+def extract_static_zip_cover(member_name: str) -> str:
+    member_name = clean_text(member_name).lstrip("/")
+    if not member_name or not STATIC_LIBRARY_ZIP.exists():
+        return ""
+    try:
+        with zipfile.ZipFile(STATIC_LIBRARY_ZIP) as archive:
+            if member_name not in archive.namelist():
+                return ""
+            target = STATIC_LIBRARY_ZIP_CACHE_DIR / "covers" / Path(member_name).name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                target.write_bytes(archive.read(member_name))
+            return str(target)
+    except Exception:
+        return ""
 
 
 @st.cache_data(ttl=60 * 60, show_spinner=False)
@@ -623,8 +642,6 @@ def load_static_library_books() -> list[dict]:
             if not isinstance(books, list):
                 return []
 
-            covers_cache_dir = STATIC_LIBRARY_ZIP_CACHE_DIR / "covers"
-            covers_cache_dir.mkdir(parents=True, exist_ok=True)
             resolved = []
             for book in books:
                 if not isinstance(book, dict):
@@ -632,13 +649,8 @@ def load_static_library_books() -> list[dict]:
                 item = dict(book)
                 local_cover = clean_text(item.get("local_cover_path"))
                 if local_cover and local_cover in names:
-                    target = covers_cache_dir / Path(local_cover).name
-                    try:
-                        target.write_bytes(archive.read(local_cover))
-                        item.setdefault("remote_cover_url", clean_text(item.get("cover_url")))
-                        item["cover_url"] = str(target)
-                    except Exception:
-                        pass
+                    item.setdefault("remote_cover_url", clean_text(item.get("cover_url")))
+                    item["cover_url"] = f"zip://{local_cover}"
                 elif clean_text(item.get("cover_url")):
                     item["cover_url"] = resolve_static_cover_path(item.get("cover_url"))
                 resolved.append(item)
@@ -2259,9 +2271,14 @@ def fetch_books_from_supabase() -> list[dict]:
         return []
 
 
-@st.cache_data(ttl=30, show_spinner=False)
+@st.cache_data(ttl=60 * 10, show_spinner=False)
 def fetch_live_books_overlay() -> list[dict]:
     """Statik paketin üstüne güncel Supabase alanlarını bindirmek için hafif canlı katman."""
+    fields = (
+        "id,isbn,title,author,publisher,reading_status,category,favorite,"
+        "tags,notes,loaned_to,estimated_price,estimated_price_source,"
+        "estimated_price_checked_at,created_at,updated_at"
+    )
     page_size = 1000
     start = 0
     rows = []
@@ -2269,7 +2286,7 @@ def fetch_live_books_overlay() -> list[dict]:
         while True:
             response = (
                 supabase.table("books")
-                .select("*")
+                .select(fields)
                 .range(start, start + page_size - 1)
                 .execute()
             )
@@ -2403,6 +2420,60 @@ def fetch_book_by_id(book_id) -> dict | None:
     except Exception as exc:
         st.warning(f"Kitap kayd? y?klenemedi: {exc}")
         return None
+
+
+def fetch_book_by_isbn(isbn: str) -> dict | None:
+    isbn = normalize_lookup_isbn(isbn)
+    if not isbn:
+        return None
+    try:
+        response = supabase.table("books").select("*").eq("isbn", isbn).limit(1).execute()
+        rows = response.data or []
+        return rows[0] if rows else None
+    except Exception as exc:
+        st.warning(f"Kitap kaydı yüklenemedi: {exc}")
+        return None
+
+
+def book_identity_key(book: dict) -> str:
+    return clean_text(book.get("id")) or only_digits(book.get("isbn")) or canonical_key(
+        f"{book.get('title', '')} {book.get('author', '')}"
+    )
+
+
+def find_static_book_by_identity(book_id: str = "", isbn: str = "") -> dict | None:
+    book_id = clean_text(book_id)
+    isbn_digits = only_digits(isbn)
+    for book in load_static_library_books():
+        if book_id and clean_text(book.get("id")) == book_id:
+            return book
+        if isbn_digits and only_digits(book.get("isbn")) == isbn_digits:
+            return book
+    return None
+
+
+def merge_book_detail(static_book: dict | None, live_book: dict | None, fallback_book: dict | None = None) -> dict:
+    item = dict(static_book or fallback_book or {})
+    static_cover_url = clean_text(item.get("cover_url"))
+    static_local_cover = clean_text(item.get("local_cover_path"))
+    static_remote_cover = clean_text(item.get("remote_cover_url"))
+
+    if live_book:
+        item.update(live_book)
+        if static_cover_url and not static_cover_url.startswith(("http://", "https://", "data:")):
+            item["cover_url"] = static_cover_url
+            if static_local_cover:
+                item["local_cover_path"] = static_local_cover
+            item["remote_cover_url"] = static_remote_cover or clean_text(live_book.get("cover_url"))
+        elif static_local_cover:
+            item["local_cover_path"] = static_local_cover
+    return item
+
+
+def fetch_book_detail_for_display(summary_book: dict) -> dict:
+    static_book = find_static_book_by_identity(summary_book.get("id"), summary_book.get("isbn"))
+    live_book = fetch_book_by_id(summary_book.get("id")) or fetch_book_by_isbn(summary_book.get("isbn"))
+    return merge_book_detail(static_book, live_book, fallback_book=summary_book)
 
 
 
@@ -4515,16 +4586,67 @@ def render_library_page(all_books: list[dict], filters: tuple):
         st.info("Bu filtrelerde kitap bulunamadı.")
         return
 
+    book_by_key = {book_identity_key(book): book for book in books}
+    selected_key = st.session_state.get("detail_library_selected_key", "")
+    rows = []
     for book in books:
-        title = book_title(book)
-        author = book_author(book)
-        status = clean_text(book.get("reading_status")) or "Okunacak"
-        with st.expander(f"📖 {title} - {author} · {status}"):
-            details_tab, edit_tab = st.tabs(["Bilgiler", "Düzenle"])
-            with details_tab:
-                render_book_details(book)
-            with edit_tab:
-                render_book_editor(book)
+        key = book_identity_key(book)
+        rows.append(
+            {
+                "Detay": key == selected_key,
+                "Kitap Adı": book_title(book),
+                "Yazar": book_author(book),
+                "Yayınevi": clean_text(book.get("publisher")),
+                "Durum": clean_text(book.get("reading_status")) or "Okunacak",
+                "ISBN": clean_text(book.get("isbn")),
+                "_key": key,
+            }
+        )
+
+    edited = st.data_editor(
+        rows,
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+        key="detail_library_lazy_list",
+        column_config={
+            "Detay": st.column_config.CheckboxColumn("Detay"),
+            "Kitap Adı": st.column_config.TextColumn("Kitap Adı", disabled=True),
+            "Yazar": st.column_config.TextColumn("Yazar", disabled=True),
+            "Yayınevi": st.column_config.TextColumn("Yayınevi", disabled=True),
+            "Durum": st.column_config.TextColumn("Durum", disabled=True),
+            "ISBN": st.column_config.TextColumn("ISBN", disabled=True),
+            "_key": None,
+        },
+    )
+
+    selected_rows = [row for row in editor_rows_to_list(edited) if row.get("Detay")]
+    if selected_rows:
+        selected_key = clean_text(selected_rows[-1].get("_key"))
+        st.session_state["detail_library_selected_key"] = selected_key
+    elif selected_key not in book_by_key:
+        selected_key = ""
+        st.session_state.pop("detail_library_selected_key", None)
+
+    if not selected_key:
+        st.info("Detayını görmek istediğin kitabın satırındaki Detay kutusunu işaretle.")
+        return
+
+    selected_book = book_by_key.get(selected_key)
+    if not selected_book:
+        st.warning("Seçili kitap bu filtrede görünmüyor.")
+        return
+
+    st.divider()
+    with st.spinner("Kitap detayları çekiliyor..."):
+        detail_book = fetch_book_detail_for_display(selected_book)
+
+    st.subheader(book_title(detail_book))
+    details_tab, edit_tab = st.tabs(["Bilgiler", "Düzenle"])
+    with details_tab:
+        render_book_details(detail_book)
+    with edit_tab:
+        render_book_editor(detail_book)
 
 
 def render_manual_book_add_section(add_nonce: int):
@@ -4853,9 +4975,11 @@ if "page" not in st.session_state:
 if "add_nonce" not in st.session_state:
     st.session_state["add_nonce"] = 0
 
-book_index = fetch_book_index()
 filters = render_sidebar()
 all_books = filters[5]
+book_index = []
+if st.session_state.get("page") in {"library", "quick_search", "recommendations", "game"}:
+    book_index = fetch_book_index()
 render_top_bar()
 
 if st.session_state.get("page") == "home":
