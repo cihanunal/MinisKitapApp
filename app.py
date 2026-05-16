@@ -41,6 +41,8 @@ BRAND_IMAGE_PATHS = [
 STATIC_LIBRARY_DIR = APP_DIR / "static_library"
 STATIC_LIBRARY_JSON = STATIC_LIBRARY_DIR / "books.json"
 STATIC_LIBRARY_COVERS_DIR = STATIC_LIBRARY_DIR / "covers"
+STATIC_LIBRARY_ZIP = APP_DIR / "static_library.zip"
+STATIC_LIBRARY_ZIP_CACHE_DIR = APP_DIR / ".static_library_cache"
 
 # --- KONFIGURASYON VE BAGLANTI ---
 st.set_page_config(page_title=APP_NAME, page_icon="📚", layout="wide")
@@ -582,37 +584,74 @@ def resolve_static_cover_path(value: str) -> str:
 
 
 def load_static_library_books() -> list[dict]:
-    if not STATIC_LIBRARY_JSON.exists():
+    if STATIC_LIBRARY_JSON.exists():
+        try:
+            payload = json.loads(STATIC_LIBRARY_JSON.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        books = payload.get("books", payload if isinstance(payload, list) else [])
+        if not isinstance(books, list):
+            return []
+        resolved = []
+        for book in books:
+            if not isinstance(book, dict):
+                continue
+            item = dict(book)
+            local_cover = clean_text(item.get("local_cover_path"))
+            if local_cover:
+                local_path = APP_DIR / local_cover
+                if local_path.exists():
+                    item.setdefault("remote_cover_url", clean_text(item.get("cover_url")))
+                    item["cover_url"] = str(local_path)
+            elif clean_text(item.get("cover_url")):
+                item["cover_url"] = resolve_static_cover_path(item.get("cover_url"))
+            resolved.append(item)
+        return resolved
+
+    if not STATIC_LIBRARY_ZIP.exists():
         return []
+
     try:
-        payload = json.loads(STATIC_LIBRARY_JSON.read_text(encoding="utf-8"))
+        with zipfile.ZipFile(STATIC_LIBRARY_ZIP) as archive:
+            names = set(archive.namelist())
+            json_name = "static_library/books.json" if "static_library/books.json" in names else "books.json"
+            if json_name not in names:
+                return []
+            payload = json.loads(archive.read(json_name).decode("utf-8"))
+            books = payload.get("books", payload if isinstance(payload, list) else [])
+            if not isinstance(books, list):
+                return []
+
+            covers_cache_dir = STATIC_LIBRARY_ZIP_CACHE_DIR / "covers"
+            covers_cache_dir.mkdir(parents=True, exist_ok=True)
+            resolved = []
+            for book in books:
+                if not isinstance(book, dict):
+                    continue
+                item = dict(book)
+                local_cover = clean_text(item.get("local_cover_path"))
+                if local_cover and local_cover in names:
+                    target = covers_cache_dir / Path(local_cover).name
+                    try:
+                        target.write_bytes(archive.read(local_cover))
+                        item.setdefault("remote_cover_url", clean_text(item.get("cover_url")))
+                        item["cover_url"] = str(target)
+                    except Exception:
+                        pass
+                elif clean_text(item.get("cover_url")):
+                    item["cover_url"] = resolve_static_cover_path(item.get("cover_url"))
+                resolved.append(item)
+            return resolved
     except Exception:
         return []
-    books = payload.get("books", payload if isinstance(payload, list) else [])
-    if not isinstance(books, list):
-        return []
-    resolved = []
-    for book in books:
-        if not isinstance(book, dict):
-            continue
-        item = dict(book)
-        local_cover = clean_text(item.get("local_cover_path"))
-        if local_cover:
-            local_path = APP_DIR / local_cover
-            if local_path.exists():
-                item.setdefault("remote_cover_url", clean_text(item.get("cover_url")))
-                item["cover_url"] = str(local_path)
-        elif clean_text(item.get("cover_url")):
-            item["cover_url"] = resolve_static_cover_path(item.get("cover_url"))
-        resolved.append(item)
-    return resolved
 
 
 def static_library_status_text() -> str:
     books = load_static_library_books()
     if not books:
         return "GitHub hizli cache aktif degil."
-    return f"GitHub hizli cache aktif: {len(books)} kitap yerel dosyadan okunuyor."
+    source = "klasor" if STATIC_LIBRARY_JSON.exists() else "ZIP"
+    return f"GitHub hizli cache aktif ({source}): {len(books)} kitap yerel dosyadan okunuyor."
 
 
 def find_static_book_by_isbn(isbn: str) -> dict | None:
@@ -2826,8 +2865,9 @@ def build_static_library_zip(books: list[dict]) -> tuple[bytes, dict]:
         archive.writestr("static_library/books.json", json.dumps(payload, ensure_ascii=False, indent=2, default=str))
         archive.writestr(
             "static_library/README.txt",
-            "Bu klasoru GitHub repo kokune koy. "
-            "Uygulama acilirken static_library/books.json varsa once onu okur.\n",
+            "GitHub web yuklemede 100 dosya sinirina takilirsan ZIP'i acma. "
+            "Bu dosyayi static_library.zip adiyla app.py ile ayni seviyeye yukle. "
+            "Istersen ZIP'i acip static_library klasorunu de repo kokune koyabilirsin.\n",
         )
     return buffer.getvalue(), {"books": len(package_books), "covers": downloaded, "cover_failures": failed}
 
@@ -3418,8 +3458,9 @@ def render_static_library_package_controls():
         st.caption(static_library_status_text())
         st.write(
             "Supabase'teki güncel kitapları ve kapakları ZIP olarak hazırlar. "
-            "ZIP içindeki static_library klasörünü GitHub repo köküne koyunca "
-            "uygulama açılışta önce bu dosyayı okur."
+            "GitHub 100 dosya sınırına takılırsa ZIP'i açma; "
+            "static_library.zip adıyla app.py ile aynı seviyeye yükle. "
+            "Uygulama bu ZIP'i doğrudan okur."
         )
         if st.button("Supabase'ten GitHub Hız Paketi Oluştur", use_container_width=True, key="build_static_library_zip"):
             with st.spinner("Supabase kitapları ve kapaklar paketleniyor..."):
@@ -3438,7 +3479,7 @@ def render_static_library_package_controls():
             st.download_button(
                 "GitHub Hız Paketini İndir (ZIP)",
                 data=st.session_state["static_library_zip_bytes"],
-                file_name=f"badgers_static_library_{datetime.now().strftime('%Y%m%d_%H%M')}.zip",
+                file_name="static_library.zip",
                 mime="application/zip",
                 use_container_width=True,
             )
