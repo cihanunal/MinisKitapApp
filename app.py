@@ -50,7 +50,7 @@ HTTP_HEADERS = {
 }
 
 REQUEST_TIMEOUT = 8
-LOOKUP_CACHE_VERSION = 6
+LOOKUP_CACHE_VERSION = 7
 BULK_LOOKUP_TIMEOUT_SECONDS = 20
 
 PAGE_LABELS = {
@@ -366,6 +366,14 @@ def is_noise_text(value: str) -> bool:
         return True
     exact_noise = {
         "listesi",
+        "lar",
+        "ler",
+        "lari",
+        "leri",
+        "kitap",
+        "kitaplar",
+        "yazarlar",
+        "yayinevleri",
         "populer",
         "popular",
         "cok satanlar",
@@ -391,8 +399,14 @@ def is_noise_text(value: str) -> bool:
         "kayit ol",
         "yorum yap",
         "alisveris listeme ekle",
+        "alisveris listesi",
         "favorilerime ekle",
+        "fiyat alarmi ekle",
+        "haber ver",
+        "hizli siparis",
         "sepete ekle",
+        "hemen al",
+        "basa don",
         "devamini oku",
         "sonuc bulunamadi",
         "input",
@@ -1210,7 +1224,9 @@ def line_value(lines: list[str], labels: list[str]) -> str:
     label_set = [label.casefold() for label in labels]
     blocked_next_words = {
         "yazar",
+        "yazarlar",
         "yayınevi",
+        "yayınevleri",
         "yayıncı",
         "çevirmen",
         "sayfa sayısı",
@@ -1220,14 +1236,18 @@ def line_value(lines: list[str], labels: list[str]) -> str:
         "dil",
         "isbn",
     }
+    blocked_next_keys = {canonical_key(word) for word in blocked_next_words}
     for index, line in enumerate(lines):
         folded = line.casefold()
         for label, folded_label in zip(labels, label_set):
             if folded.startswith(folded_label):
-                value = clean_text(line[len(label):].strip(" :;-"))
+                rest = line[len(label):]
+                if rest and not rest[:1].isspace() and rest[:1] not in ":;-":
+                    continue
+                value = clean_text(rest.strip(" :;-"))
                 if (
                     value
-                    and value.casefold() not in blocked_next_words
+                    and canonical_key(value) not in blocked_next_keys
                     and not is_noise_text(value)
                     and len(value) < 150
                 ):
@@ -1236,7 +1256,7 @@ def line_value(lines: list[str], labels: list[str]) -> str:
                     next_line = clean_text(lines[index + 1])
                     if (
                         next_line
-                        and next_line.casefold() not in blocked_next_words
+                        and canonical_key(next_line) not in blocked_next_keys
                         and not is_noise_text(next_line)
                         and len(next_line) < 150
                     ):
@@ -1374,6 +1394,9 @@ def parse_isbn_detail_line(line: str, book: dict, variants: list[str]) -> dict:
 
 
 def record_from_isbn_context(lines: list[str], variants: list[str], source: str, url: str, title_hint: str = "") -> dict | None:
+    if looks_like_search_page(url, title_hint):
+        return None
+
     for index, line in enumerate(lines):
         if not variant_in_text(variants, line):
             continue
@@ -1382,7 +1405,7 @@ def record_from_isbn_context(lines: list[str], variants: list[str], source: str,
         after = clean_context_lines(lines[index + 1 : index + 10])
         window = before + [line] + after
 
-        author = line_value(window, ["Yazar", "Yazarlar", "Author"])
+        author = line_value(window, ["Yazar", "Author"])
         publisher = normalize_publisher_name(
             line_value(window, ["Yayınevi", "Yayıncı", "Yayinevi", "Publisher"])
         )
@@ -1475,9 +1498,10 @@ def extract_book_from_html(html: str, variants: list[str], source: str, url: str
         if record and (page_has_isbn or record.get("_isbn_matched")):
             records.append(record)
 
-    context_record = record_from_isbn_context(lines, variants, source, url, title_hint=title_hint)
-    if context_record:
-        records.append(context_record)
+    if not search_page:
+        context_record = record_from_isbn_context(lines, variants, source, url, title_hint=title_hint)
+        if context_record:
+            records.append(context_record)
 
     if records and (page_has_isbn or any(record.get("_isbn_matched") for record in records)):
         return sanitize_scraped_record(max(records, key=score_record), variants, source)
@@ -1502,7 +1526,7 @@ def extract_book_from_html(html: str, variants: list[str], source: str, url: str
     book.update(
         {
             "title": title,
-            "author": line_value(lines, ["Yazar", "Yazarlar"]),
+            "author": line_value(lines, ["Yazar"]),
             "translator": line_value(lines, ["Çevirmen", "Cevirmen"]),
             "publisher": normalize_publisher_name(
                 line_value(lines, ["Yayınevi", "Yayıncı", "Yayinevi", "Publisher"])
@@ -1532,6 +1556,9 @@ def candidate_product_links(soup: BeautifulSoup, base_url: str, variants: list[s
     candidates = []
     bad_tokens = (
         "sepet",
+        "siparis",
+        "hizlisiparis",
+        "checkout",
         "cart",
         "login",
         "uye",
@@ -1557,12 +1584,19 @@ def candidate_product_links(soup: BeautifulSoup, base_url: str, variants: list[s
         folded = full_url.casefold()
         if any(token in folded for token in bad_tokens):
             continue
-        link_text = clean_text(anchor.get_text(" "))
-        if is_noise_text(link_text):
+        image_text = " ".join(
+            clean_text(img.get("alt") or img.get("title"))
+            for img in anchor.find_all("img")
+        )
+        link_text = clean_text(anchor.get_text(" ") or anchor.get("title") or image_text)
+        product_like = "/products/" in folded or "/kitap/" in folded or "/mobil/" in folded
+        if is_noise_text(link_text) and not product_like:
             continue
         score = 0
         if any(variant and variant in only_digits(full_url + " " + link_text) for variant in variants):
             score += 10
+        if product_like:
+            score += 8
         if any(token in folded for token in good_tokens):
             score += 4
         path_parts = [part for part in urlparse(full_url).path.split("/") if part]
