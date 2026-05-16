@@ -146,6 +146,7 @@ SAVE_FIELDS = [
     "estimated_price_checked_at",
     "category",
     "reading_status",
+    "o_da_okudu",
     "favorite",
     "tags",
     "notes",
@@ -229,6 +230,7 @@ def blank_book(isbn: str = "") -> dict:
     book["isbn"] = isbn
     book["category"] = "Kategorisiz"
     book["reading_status"] = "Okunacak"
+    book["o_da_okudu"] = False
     book["favorite"] = False
     book["tags"] = []
     book["notes"] = ""
@@ -532,6 +534,7 @@ def normalize_book_payload(data: dict) -> dict:
     normalized["estimated_price_checked_at"] = clean_text(normalized.get("estimated_price_checked_at")) or None
     normalized["category"] = clean_text(normalized.get("category")) or "Kategorisiz"
     normalized["reading_status"] = clean_text(normalized.get("reading_status")) or "Okunacak"
+    normalized["o_da_okudu"] = bool(normalized.get("o_da_okudu"))
     normalized["favorite"] = bool(normalized.get("favorite"))
     normalized["tags"] = parse_tags(normalized.get("tags"))
     normalized["notes"] = clean_text(normalized.get("notes"))
@@ -2275,7 +2278,7 @@ def fetch_books_from_supabase() -> list[dict]:
 def fetch_live_books_overlay() -> list[dict]:
     """Statik paketin üstüne güncel Supabase alanlarını bindirmek için hafif canlı katman."""
     fields = (
-        "id,isbn,title,author,publisher,reading_status,category,favorite,"
+        "id,isbn,title,author,publisher,reading_status,o_da_okudu,category,favorite,"
         "tags,notes,loaned_to,estimated_price,estimated_price_source,"
         "estimated_price_checked_at,created_at,updated_at"
     )
@@ -2941,6 +2944,7 @@ def books_to_csv(books: list[dict]) -> str:
         "page_count",
         "first_print_year",
         "reading_status",
+        "o_da_okudu",
         "category",
         "favorite",
         "tags",
@@ -3356,7 +3360,8 @@ def status_badges(book: dict):
     status = clean_text(book.get("reading_status")) or "Okunacak"
     tags = parse_tags(book.get("tags"))
     favorite = "Favori" if book.get("favorite") else ""
-    pieces = [status, favorite, *tags[:4]]
+    o_da_okudu = "O ;) da Okudu" if book.get("o_da_okudu") else ""
+    pieces = [status, o_da_okudu, favorite, *tags[:4]]
     html = "".join(f'<span class="status-pill">{piece}</span>' for piece in pieces if piece)
     st.markdown(html, unsafe_allow_html=True)
 
@@ -3381,6 +3386,11 @@ def build_form_data(prefix: str, initial: dict) -> dict:
             READING_STATUS_OPTIONS,
             index=status_index(initial.get("reading_status")),
             key=f"{prefix}_status",
+        )
+        o_da_okudu = st.checkbox(
+            "O ;) da Okudu",
+            value=bool(initial.get("o_da_okudu")),
+            key=f"{prefix}_o_da_okudu",
         )
         category = st.selectbox(
             "Kategori",
@@ -3430,6 +3440,7 @@ def build_form_data(prefix: str, initial: dict) -> dict:
         "source_url": clean_text(initial.get("source_url")),
         "category": category,
         "reading_status": reading_status,
+        "o_da_okudu": o_da_okudu,
         "favorite": favorite,
         "tags": parse_tags(tags),
         "notes": notes,
@@ -3476,7 +3487,7 @@ def kitapsec_update_payload(current: dict, fetched: dict) -> dict:
         value = fetched.get(field)
         if is_usable_kitapsec_update_value(field, value):
             payload[field] = clean_text(value)
-    for field in ("category", "reading_status", "favorite", "tags", "notes", "loaned_to", "rating"):
+    for field in ("category", "reading_status", "o_da_okudu", "favorite", "tags", "notes", "loaned_to", "rating"):
         payload[field] = current.get(field)
     return payload
 
@@ -3625,6 +3636,7 @@ def render_book_details(book: dict):
     with more_col:
         st.write(f"**Çevirmen:** {book.get('translator') or '-'}")
         st.write(f"**Kategori:** {book.get('category') or 'Kategorisiz'}")
+        st.write(f"**O ;) da Okudu:** {'Evet' if book.get('o_da_okudu') else 'Hayır'}")
         st.write(f"**Puan:** {book.get('rating') or '-'}")
         st.write(f"**Ödünç:** {book.get('loaned_to') or '-'}")
         if clean_text(book.get("notes")):
@@ -4612,7 +4624,6 @@ def render_bulk_add_page():
 def render_library_page(all_books: list[dict], filters: tuple):
     personal_filter, status_filter, tag_filter, search_term, sort_by = filters
     st.header("Detaylı Kütüphanem")
-    render_static_library_package_controls()
 
     inline_search = st.text_input(
         "Listede ara",
@@ -4627,10 +4638,14 @@ def render_library_page(all_books: list[dict], filters: tuple):
     total = len(all_books)
     st.caption(f"{len(books)} kitap gösteriliyor · toplam {total} kitap")
 
-    render_library_kitapsec_bulk_controls(all_books, books)
+    def render_detail_library_footer():
+        st.divider()
+        render_static_library_package_controls()
+        render_library_kitapsec_bulk_controls(all_books, books)
 
     if not books:
         st.info("Bu filtrelerde kitap bulunamadı.")
+        render_detail_library_footer()
         return
 
     book_by_key = {book_identity_key(book): book for book in books}
@@ -4679,6 +4694,7 @@ def render_library_page(all_books: list[dict], filters: tuple):
                 "Yazar": book_author(book),
                 "Yayınevi": clean_text(book.get("publisher")),
                 "Durum": clean_text(book.get("reading_status")) or "Okunacak",
+                "O ;) da Okudu": "Evet" if book.get("o_da_okudu") else "",
                 "ISBN": clean_text(book.get("isbn")),
                 "_key": key,
             }
@@ -4697,6 +4713,7 @@ def render_library_page(all_books: list[dict], filters: tuple):
             "Yazar": st.column_config.TextColumn("Yazar", disabled=True),
             "Yayınevi": st.column_config.TextColumn("Yayınevi", disabled=True),
             "Durum": st.column_config.TextColumn("Durum", disabled=True),
+            "O ;) da Okudu": st.column_config.TextColumn("O ;) da Okudu", disabled=True),
             "ISBN": st.column_config.TextColumn("ISBN", disabled=True),
             "_key": None,
         },
@@ -4715,6 +4732,7 @@ def render_library_page(all_books: list[dict], filters: tuple):
 
     if not selected_key:
         st.info("Detayını görmek istediğin kitabın satırındaki Detay kutusunu işaretle.")
+        render_detail_library_footer()
         return
 
     if len(selected_keys) > 1:
@@ -4738,6 +4756,7 @@ def render_library_page(all_books: list[dict], filters: tuple):
     selected_book = book_by_key.get(selected_key)
     if not selected_book:
         st.warning("Seçili kitap bu filtrede görünmüyor.")
+        render_detail_library_footer()
         return
 
     st.divider()
@@ -4750,6 +4769,8 @@ def render_library_page(all_books: list[dict], filters: tuple):
         render_book_details(detail_book)
     with edit_tab:
         render_book_editor(detail_book)
+
+    render_detail_library_footer()
 
 
 def render_manual_book_add_section(add_nonce: int):
