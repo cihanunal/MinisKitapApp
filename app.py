@@ -50,7 +50,7 @@ HTTP_HEADERS = {
 }
 
 REQUEST_TIMEOUT = 8
-LOOKUP_CACHE_VERSION = 5
+LOOKUP_CACHE_VERSION = 6
 BULK_LOOKUP_TIMEOUT_SECONDS = 20
 
 PAGE_LABELS = {
@@ -151,7 +151,7 @@ TURKISH_RETAILERS = [
     ("Kitapyurdu", "https://www.kitapyurdu.com/index.php?route=product/search&filter_name={isbn}"),
     ("BKM Kitap", "https://www.bkmkitap.com/arama?q={isbn}"),
     ("Kitapsepeti", "https://www.kitapsepeti.com/arama?q={isbn}"),
-    ("Kitapseç", "https://www.kitapsec.com/Arama/index.php?key={isbn}"),
+    ("Kitapseç", "https://www.kitapsec.com/Arama/index.php?a={isbn}"),
     ("Idefix", "https://www.idefix.com/search?q={isbn}"),
     ("İkra Kitap", "https://www.ikrakitap.com/arama?q={isbn}"),
     ("İmge", "https://www.imge.com.tr/arama?q={isbn}"),
@@ -159,8 +159,15 @@ TURKISH_RETAILERS = [
 ]
 
 SITE_SPECIFIC_RETAILERS = {
-    "kitapsec": ("Kitapseç", "https://www.kitapsec.com/Arama/index.php?key={isbn}"),
+    "kitapsec": ("Kitapseç", "https://www.kitapsec.com/Arama/index.php?a={isbn}"),
     "kitapyurdu": ("Kitapyurdu", "https://www.kitapyurdu.com/index.php?route=product/search&filter_name={isbn}"),
+}
+
+SITE_EXTRA_SEARCH_TEMPLATES = {
+    "Kitapseç": [
+        "https://www.kitapsec.com/Mch.php?a={isbn}",
+        "https://www.kitapsec.com/mobil/arama.php?a={isbn}",
+    ],
 }
 
 DIRECT_ISBN_PAGES = [
@@ -1584,34 +1591,43 @@ def search_specific_retailer(
 ) -> list[dict]:
     records = []
     seen_links = set()
+    search_templates = unique_keep_order([template, *SITE_EXTRA_SEARCH_TEMPLATES.get(source, [])])
 
     for isbn in variants:
         if deadline_expired(deadline):
             break
-        search_url = template.format(isbn=isbn)
-        final_url, html = http_get_html(search_url, deadline=deadline)
-        if not html:
-            continue
 
-        record = extract_book_from_html(html, variants, source, final_url)
-        if record:
-            records.append(record)
-            break
-
-        soup = BeautifulSoup(html, "html.parser")
-        for link in candidate_product_links(soup, final_url, variants)[:link_limit]:
+        for search_template in search_templates:
             if deadline_expired(deadline):
                 break
-            if link in seen_links:
+            search_url = search_template.format(isbn=isbn)
+            final_url, html = http_get_html(search_url, deadline=deadline)
+            if not html:
                 continue
-            seen_links.add(link)
-            product_url, product_html = http_get_html(link, deadline=deadline)
-            if not product_html:
-                continue
-            record = extract_book_from_html(product_html, variants, source, product_url)
+
+            record = extract_book_from_html(html, variants, source, final_url)
             if record:
                 records.append(record)
-                return records
+                break
+
+            soup = BeautifulSoup(html, "html.parser")
+            for link in candidate_product_links(soup, final_url, variants)[:link_limit]:
+                if deadline_expired(deadline):
+                    break
+                if link in seen_links:
+                    continue
+                seen_links.add(link)
+                product_url, product_html = http_get_html(link, deadline=deadline)
+                if not product_html:
+                    continue
+                record = extract_book_from_html(product_html, variants, source, product_url)
+                if record:
+                    records.append(record)
+                    return records
+            if records:
+                break
+        if records:
+            break
     return records
 
 
