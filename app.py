@@ -63,15 +63,15 @@ BULK_LOOKUP_TIMEOUT_SECONDS = 20
 PAGE_LABELS = {
     "home": "✨ Ana Ekran",
     "library": "🏠 Kütüphanem",
-    "detail_library": "\U0001f4da Detayl\u0131 K\u00fct\u00fcphanem",
+    "detail_library": "📚 Detaylı Kütüphanem",
     "add": "🔍 Kitap Ekle",
-    "quick_search": "⚡ Hızlı Arama",
-    "bulk_add": "🧾 Toplu Kitap Ekle",
-    "lookup_queue": "⏳ Sonra Aranacaklar",
-    "missing_info": "🧩 Eksik Bilgiler",
     "wishlist": "💫 Wishlist",
     "recommendations": "🎁 Tavsiyeler",
     "game": "🎮 Oyun Oyna",
+    "bulk_add": "🧾 Toplu Kitap Ekle",
+    "lookup_queue": "⏳ Sonra Aranacaklar",
+    "missing_info": "🧩 Eksik Bilgiler",
+    "quick_search": "⚡ Hızlı Arama",
 }
 
 READING_STATUS_OPTIONS = [
@@ -111,6 +111,7 @@ BOOK_FIELDS = [
     "translator",
     "publisher",
     "page_count",
+    "current_page",
     "paper_type",
     "dimensions",
     "first_print_year",
@@ -133,6 +134,7 @@ SAVE_FIELDS = [
     "translator",
     "publisher",
     "page_count",
+    "current_page",
     "paper_type",
     "dimensions",
     "first_print_year",
@@ -236,6 +238,7 @@ def blank_book(isbn: str = "") -> dict:
     book["isbn"] = isbn
     book["category"] = "Kategorisiz"
     book["reading_status"] = "Okunacak"
+    book["current_page"] = ""
     book["o_da_okudu"] = False
     book["reading_started_at"] = ""
     book["reading_finished_at"] = ""
@@ -555,6 +558,7 @@ def normalize_book_payload(data: dict) -> dict:
     normalized["translator"] = dedupe_comma_values(normalized.get("translator"))
     normalized["publisher"] = normalize_publisher_name(normalized.get("publisher"))
     normalized["page_count"] = clean_text(normalized.get("page_count"))
+    normalized["current_page"] = clean_text(only_digits(normalized.get("current_page")) or normalized.get("current_page"))
     normalized["paper_type"] = clean_text(normalized.get("paper_type"))
     normalized["dimensions"] = clean_text(normalized.get("dimensions"))
     normalized["first_print_year"] = clean_text(normalized.get("first_print_year"))
@@ -2318,7 +2322,7 @@ def fetch_books_from_supabase() -> list[dict]:
 def fetch_live_books_overlay() -> list[dict]:
     """Statik paketin üstüne güncel Supabase alanlarını bindirmek için hafif canlı katman."""
     fields = (
-        "id,isbn,title,author,publisher,reading_status,o_da_okudu,"
+        "id,isbn,title,author,publisher,reading_status,current_page,o_da_okudu,"
         "reading_started_at,reading_finished_at,reread_wanted,reading_comment,"
         "category,favorite,tags,notes,loaned_to,estimated_price,estimated_price_source,"
         "estimated_price_checked_at,created_at,updated_at"
@@ -2554,6 +2558,25 @@ def fetch_library_summary() -> dict:
     return summary
 
 
+def reading_progress(book: dict) -> dict:
+    total_pages = safe_int(only_digits(book.get("page_count")), 0)
+    current_page = safe_int(only_digits(book.get("current_page")), 0)
+    status = clean_text(book.get("reading_status"))
+    if status == "Okundu" and total_pages:
+        current_page = max(current_page, total_pages)
+    if total_pages and current_page:
+        percent = min(100, round((current_page / total_pages) * 100, 1))
+    elif status == "Okundu":
+        percent = 100
+    else:
+        percent = 0
+    return {
+        "current_page": current_page,
+        "total_pages": total_pages,
+        "percent": percent,
+    }
+
+
 def fetch_dashboard_stats() -> dict:
     rows = fetch_books() if load_static_library_books() else []
     if not rows:
@@ -2561,7 +2584,7 @@ def fetch_dashboard_stats() -> dict:
             response = (
                 supabase.table("books")
                 .select(
-                    "id,isbn,title,author,publisher,reading_status,page_count,"
+                    "id,isbn,title,author,publisher,reading_status,page_count,current_page,"
                     "estimated_price,reading_finished_at"
                 )
                 .execute()
@@ -2581,9 +2604,22 @@ def fetch_dashboard_stats() -> dict:
     known_value = 0.0
     known_value_count = 0
     missing_price = []
+    currently_reading = []
     for row in rows:
-        if clean_text(row.get("reading_status")) != "Okundu":
+        status = clean_text(row.get("reading_status"))
+        if status != "Okundu":
             unread_pages += safe_int(only_digits(row.get("page_count")), 0)
+        if status == "Okunuyor":
+            progress = reading_progress(row)
+            currently_reading.append(
+                {
+                    "id": row.get("id"),
+                    "isbn": clean_text(row.get("isbn")),
+                    "title": book_title(row),
+                    "author": book_author(row),
+                    **progress,
+                }
+            )
         price = row.get("estimated_price")
         if price:
             try:
@@ -2619,6 +2655,7 @@ def fetch_dashboard_stats() -> dict:
         "top_author_count": top_author_count,
         "top_publisher": top_publisher,
         "top_publisher_count": top_publisher_count,
+        "currently_reading": currently_reading,
         "missing_price": missing_price,
     }
 
@@ -3009,6 +3046,7 @@ def books_to_csv(books: list[dict]) -> str:
         "publisher",
         "translator",
         "page_count",
+        "current_page",
         "first_print_year",
         "reading_status",
         "o_da_okudu",
@@ -3505,6 +3543,11 @@ def build_form_data(prefix: str, initial: dict) -> dict:
             key=f"{prefix}_year",
         )
         page_count = st.text_input("Sayfa Sayısı", value=clean_text(initial.get("page_count")), key=f"{prefix}_pages")
+        current_page = st.text_input(
+            "Şu Anki Sayfa",
+            value=clean_text(initial.get("current_page")),
+            key=f"{prefix}_current_page",
+        )
     with c2:
         reading_status = st.selectbox(
             "Okunma Durumu",
@@ -3581,6 +3624,7 @@ def build_form_data(prefix: str, initial: dict) -> dict:
         "translator": translator,
         "publisher": publisher,
         "page_count": page_count,
+        "current_page": current_page,
         "paper_type": paper_type,
         "dimensions": dimensions,
         "first_print_year": first_print_year,
@@ -3803,6 +3847,12 @@ def render_book_details(book: dict):
         st.write(f"**Yayınevi:** {book.get('publisher') or '-'}")
         st.write(f"**Yayın Yılı:** {book.get('first_print_year') or '-'}")
         st.write(f"**Sayfa Sayısı:** {book.get('page_count') or '-'}")
+        progress = reading_progress(book)
+        if progress["current_page"] or progress["percent"]:
+            total_text = progress["total_pages"] or "?"
+            st.write(f"**Okuma Yüzdesi:** %{progress['percent']} ({progress['current_page']}/{total_text})")
+            if progress["percent"]:
+                st.progress(int(progress["percent"]))
     with more_col:
         st.write(f"**Çevirmen:** {book.get('translator') or '-'}")
         st.write(f"**Kategori:** {book.get('category') or 'Kategorisiz'}")
@@ -3844,6 +3894,8 @@ def render_quick_reading_controls(book: dict):
                     data["reading_started_at"] = today
                 if status == "Okundu" and not normalize_date_text(data.get("reading_finished_at")):
                     data["reading_finished_at"] = today
+                if status == "Okundu" and clean_text(data.get("page_count")):
+                    data["current_page"] = only_digits(data.get("page_count")) or clean_text(data.get("page_count"))
                 if update_book(book_id, data):
                     st.success(f"Durum güncellendi: {status}")
                     st.rerun()
@@ -4022,6 +4074,161 @@ def render_quick_search_page(book_index: list[dict]):
                 st.write(f"- {item}")
 
 
+def lookup_book_for_home_barcode(isbn: str) -> tuple[dict, bool]:
+    normalized_isbn = normalize_lookup_isbn(isbn)
+    book = blank_book(normalized_isbn)
+    if not normalized_isbn:
+        return book, False
+    lookup = get_book_info_comprehensive(
+        normalized_isbn,
+        max_seconds=20,
+        web_result_limit=4,
+        retailer_link_limit=6,
+    )
+    if lookup.get("ok") and lookup.get("book", {}).get("title"):
+        book.update(lookup["book"])
+        book["isbn"] = normalized_isbn
+        return book, True
+    return book, False
+
+
+def ensure_home_barcode_book_in_library(isbn: str) -> dict | None:
+    normalized_isbn = normalize_lookup_isbn(isbn)
+    existing = isbn_exists(normalized_isbn)
+    if existing:
+        return existing
+
+    book, found = lookup_book_for_home_barcode(normalized_isbn)
+    if not found or not clean_text(book.get("title")):
+        save_pending_isbn(normalized_isbn, note="Ana ekran barkod okutma sırasında bulunamadı", source="home_barcode")
+        return None
+
+    if insert_book(book):
+        return isbn_exists(normalized_isbn)
+    return None
+
+
+def render_currently_reading_widget(currently_reading: list[dict]):
+    st.subheader("Şu An Ne Okuyorum?")
+    if not currently_reading:
+        st.info("Okunuyor durumunda kitap görünmüyor.")
+        return
+
+    for book in currently_reading[:8]:
+        title = clean_text(book.get("title")) or "İsimsiz Kitap"
+        author = clean_text(book.get("author")) or "Yazar Bilinmiyor"
+        current_page = safe_int(book.get("current_page"), 0)
+        total_pages = safe_int(book.get("total_pages"), 0)
+        percent = float(book.get("percent") or 0)
+        st.write(f"**{title}** - {author}")
+        if total_pages:
+            st.caption(f"{current_page}/{total_pages} sayfa · %{percent}")
+        else:
+            st.caption("Toplam sayfa bilgisi yok; yüzde hesaplanamadı.")
+        st.progress(min(100, int(percent)))
+
+
+def render_home_barcode_panel():
+    st.subheader("Kitap Barkodu Okut")
+    if st.button("Barkod Okutma Panelini Aç / Kapat", use_container_width=True, key="home_barcode_toggle"):
+        st.session_state["home_barcode_panel_open"] = not st.session_state.get("home_barcode_panel_open", False)
+        st.rerun()
+
+    if not st.session_state.get("home_barcode_panel_open", False):
+        return
+
+    with st.expander("Barkod Okut ve Nereye Ekleneceğini Seç", expanded=True):
+        camera_col, upload_col, manual_col = st.columns(3)
+        with camera_col:
+            camera_file = st.camera_input("Kamerayla okut", key="home_barcode_camera")
+        with upload_col:
+            upload_file = st.file_uploader(
+                "Barkod fotoğrafı yükle",
+                type=["png", "jpg", "jpeg"],
+                key="home_barcode_upload",
+            )
+        with manual_col:
+            manual_isbn = st.text_input("ISBN elle gir", key="home_barcode_manual_isbn")
+
+        decoded = decode_isbn_from_image(camera_file) or decode_isbn_from_image(upload_file)
+        target_isbn = normalize_lookup_isbn(manual_isbn or decoded)
+        if decoded:
+            st.success(f"Barkod okundu: {normalize_lookup_isbn(decoded)}")
+        if not target_isbn:
+            st.caption("Barkod okutunca veya ISBN yazınca ekleme seçenekleri burada açılır.")
+            return
+
+        st.write(f"**Seçili ISBN:** {target_isbn}")
+        destination = st.selectbox(
+            "Bu kitap nereye eklensin?",
+            [
+                "Kütüphaneye Ekle",
+                "Wishlist'e Ekle",
+                "Sonra Aranacaklara Ekle",
+                "Tavsiye Listesine Ekle",
+            ],
+            key="home_barcode_destination",
+        )
+
+        selected_recommendation = None
+        if destination == "Tavsiye Listesine Ekle":
+            lists = fetch_recommendation_lists()
+            if lists:
+                selected_recommendation = st.selectbox(
+                    "Tavsiye listesi",
+                    lists,
+                    format_func=lambda row: row.get("person_name", "İsimsiz"),
+                    key="home_barcode_recommendation_list",
+                )
+            else:
+                st.warning("Tavsiye listesi yok. Önce Tavsiyeler sayfasında bir liste oluştur.")
+
+        if not st.button("Seçilen Yere Ekle", type="primary", use_container_width=True, key="home_barcode_add"):
+            return
+
+        if destination == "Sonra Aranacaklara Ekle":
+            if save_pending_isbn(target_isbn, source="home_barcode"):
+                st.success("ISBN Sonra Aranacaklar listesine eklendi.")
+            return
+
+        if destination == "Kütüphaneye Ekle":
+            if isbn_exists(target_isbn):
+                st.warning("Bu ISBN zaten kütüphanede kayıtlı.")
+                return
+            with st.spinner("Kitap bilgileri aranıyor..."):
+                book, found = lookup_book_for_home_barcode(target_isbn)
+            if found and insert_book(book):
+                st.success(f"Kütüphaneye eklendi: {book_title(book)}")
+            else:
+                save_pending_isbn(target_isbn, note="Ana ekrandan kütüphaneye eklenirken bulunamadı", source="home_barcode")
+                st.warning("Kitap bilgisi bulunamadı; ISBN Sonra Aranacaklar listesine kaydedildi.")
+            return
+
+        if destination == "Wishlist'e Ekle":
+            with st.spinner("Kitap bilgileri aranıyor..."):
+                book, found = lookup_book_for_home_barcode(target_isbn)
+            if not found:
+                book["title"] = f"ISBN {target_isbn}"
+            book["priority"] = len(fetch_wishlist_items()) + 1
+            book["note"] = "Ana ekrandan barkodla eklendi"
+            if insert_wishlist_item(book):
+                st.success("Wishlist'e eklendi.")
+            return
+
+        if destination == "Tavsiye Listesine Ekle":
+            if not selected_recommendation:
+                st.warning("Tavsiye listesi seçmeden ekleyemem.")
+                return
+            with st.spinner("Kitap kütüphanede hazırlanıyor..."):
+                library_book = ensure_home_barcode_book_in_library(target_isbn)
+            if not library_book:
+                st.warning("Kitap bilgisi bulunamadı; ISBN Sonra Aranacaklar listesine kaydedildi.")
+                return
+            position = len(fetch_recommendation_items(selected_recommendation.get("id"))) + 1
+            if add_recommendation_item(selected_recommendation.get("id"), library_book.get("id"), position):
+                st.success("Kitap tavsiye listesine eklendi.")
+
+
 def render_home_page():
     st.header("Ana Ekran")
     stats = fetch_dashboard_stats()
@@ -4040,6 +4247,34 @@ def render_home_page():
     col6.metric("En Çok Okunan Yazar", stats["top_author"] or "-", f"{stats['top_author_count']} kitap" if stats["top_author_count"] else None)
     col7.metric("En Çok Okunan Yayınevi", stats["top_publisher"] or "-", f"{stats['top_publisher_count']} kitap" if stats["top_publisher_count"] else None)
     col8.metric("Tahmini Değer", format_tl(stats["known_value"]))
+
+    nav_col1, nav_col2, nav_col3 = st.columns(3)
+    with nav_col1:
+        if st.button("Detaylı Kütüphanem", type="primary", use_container_width=True, key="home_go_detail_library"):
+            set_page("detail_library")
+            st.rerun()
+    with nav_col2:
+        if st.button("Yeni Kitap Ekle", use_container_width=True, key="home_go_add_book"):
+            set_page("add")
+            st.rerun()
+    with nav_col3:
+        if st.button("Eksik Bilgiler", use_container_width=True, key="home_go_missing_info"):
+            set_page("missing_info")
+            st.rerun()
+
+    st.subheader("Okuma Panosu")
+    board_col1, board_col2 = st.columns([0.58, 0.42])
+    with board_col1:
+        st.write("**Genel okuma ilerlemesi**")
+        st.progress(min(100, int(stats["read_percent"])))
+        st.caption(f"{read_count}/{total} kitap okundu.")
+    with board_col2:
+        st.write("**Kütüphane değeri**")
+        st.metric("Fiyatı bilinen kitap", stats["known_value_count"])
+        st.caption(format_tl(stats["known_value"]))
+
+    render_currently_reading_widget(stats.get("currently_reading", []))
+    render_home_barcode_panel()
 
     st.subheader("Kalan Kitaplar Ne Zaman Biter?")
     daily_pages = st.number_input("Günde kaç sayfa okuyacaksın?", min_value=1, max_value=2000, value=100, step=10)
