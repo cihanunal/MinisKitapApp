@@ -14,6 +14,7 @@ from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
 
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from bs4 import BeautifulSoup
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from pyzbar.pyzbar import decode
@@ -3111,6 +3112,60 @@ def inject_css():
     )
 
 
+def inject_pwa_head():
+    components.html(
+        """
+        <script>
+        (function () {
+          const doc = window.parent.document;
+          const appName = "Badger's Book App";
+          const manifestHref = "app/static/manifest.json";
+          const icon192 = "app/static/icons/icon-192.png";
+          const icon512 = "app/static/icons/icon-512.png";
+
+          function upsertMeta(name, content, attrName = "name") {
+            let el = doc.head.querySelector(`meta[${attrName}="${name}"]`);
+            if (!el) {
+              el = doc.createElement("meta");
+              el.setAttribute(attrName, name);
+              doc.head.appendChild(el);
+            }
+            el.setAttribute("content", content);
+          }
+
+          function upsertLink(rel, href, extra = {}) {
+            let el = doc.head.querySelector(`link[rel="${rel}"]`);
+            if (!el) {
+              el = doc.createElement("link");
+              el.setAttribute("rel", rel);
+              doc.head.appendChild(el);
+            }
+            el.setAttribute("href", href);
+            for (const [key, value] of Object.entries(extra)) {
+              el.setAttribute(key, value);
+            }
+          }
+
+          doc.title = appName;
+          upsertLink("manifest", manifestHref);
+          upsertLink("icon", icon192, { type: "image/png", sizes: "192x192" });
+          upsertLink("apple-touch-icon", icon192, { sizes: "192x192" });
+          upsertLink("apple-touch-icon", icon512, { sizes: "512x512" });
+          upsertMeta("application-name", appName);
+          upsertMeta("apple-mobile-web-app-title", appName);
+          upsertMeta("theme-color", "#0e1117");
+          upsertMeta("mobile-web-app-capable", "yes");
+          upsertMeta("apple-mobile-web-app-capable", "yes");
+          upsertMeta("apple-mobile-web-app-status-bar-style", "black-translucent");
+          upsertMeta("viewport", "width=device-width, initial-scale=1, viewport-fit=cover");
+        })();
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+
+
 def set_page(page: str):
     st.session_state["page"] = page
 
@@ -5120,6 +5175,7 @@ def render_lookup_queue_page():
 
 # --- UYGULAMA ---
 inject_css()
+inject_pwa_head()
 
 if "page" not in st.session_state:
     st.session_state["page"] = "home"
