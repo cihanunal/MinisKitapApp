@@ -68,6 +68,7 @@ PAGE_LABELS = {
     "quick_search": "⚡ Hızlı Arama",
     "bulk_add": "🧾 Toplu Kitap Ekle",
     "lookup_queue": "⏳ Sonra Aranacaklar",
+    "missing_info": "🧩 Eksik Bilgiler",
     "wishlist": "💫 Wishlist",
     "recommendations": "🎁 Tavsiyeler",
     "game": "🎮 Oyun Oyna",
@@ -148,6 +149,10 @@ SAVE_FIELDS = [
     "category",
     "reading_status",
     "o_da_okudu",
+    "reading_started_at",
+    "reading_finished_at",
+    "reread_wanted",
+    "reading_comment",
     "favorite",
     "tags",
     "notes",
@@ -232,6 +237,10 @@ def blank_book(isbn: str = "") -> dict:
     book["category"] = "Kategorisiz"
     book["reading_status"] = "Okunacak"
     book["o_da_okudu"] = False
+    book["reading_started_at"] = ""
+    book["reading_finished_at"] = ""
+    book["reread_wanted"] = False
+    book["reading_comment"] = ""
     book["favorite"] = False
     book["tags"] = []
     book["notes"] = ""
@@ -499,6 +508,32 @@ def safe_int(value, default: int = 0) -> int:
         return default
 
 
+def normalize_date_text(value) -> str:
+    value = clean_text(value)
+    if not value:
+        return ""
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(value, fmt).date().isoformat()
+        except Exception:
+            pass
+    return value
+
+
+def days_between_dates(start_value, end_value) -> int | None:
+    start = normalize_date_text(start_value)
+    end = normalize_date_text(end_value)
+    if not start or not end:
+        return None
+    try:
+        start_date = datetime.strptime(start, "%Y-%m-%d").date()
+        end_date = datetime.strptime(end, "%Y-%m-%d").date()
+    except Exception:
+        return None
+    days = (end_date - start_date).days + 1
+    return days if days > 0 else None
+
+
 def status_index(value: str) -> int:
     value = clean_text(value) or "Okunacak"
     if value in READING_STATUS_OPTIONS:
@@ -536,6 +571,10 @@ def normalize_book_payload(data: dict) -> dict:
     normalized["category"] = clean_text(normalized.get("category")) or "Kategorisiz"
     normalized["reading_status"] = clean_text(normalized.get("reading_status")) or "Okunacak"
     normalized["o_da_okudu"] = bool(normalized.get("o_da_okudu"))
+    normalized["reading_started_at"] = normalize_date_text(normalized.get("reading_started_at"))
+    normalized["reading_finished_at"] = normalize_date_text(normalized.get("reading_finished_at"))
+    normalized["reread_wanted"] = bool(normalized.get("reread_wanted"))
+    normalized["reading_comment"] = clean_text(normalized.get("reading_comment"))
     normalized["favorite"] = bool(normalized.get("favorite"))
     normalized["tags"] = parse_tags(normalized.get("tags"))
     normalized["notes"] = clean_text(normalized.get("notes"))
@@ -2279,8 +2318,9 @@ def fetch_books_from_supabase() -> list[dict]:
 def fetch_live_books_overlay() -> list[dict]:
     """Statik paketin üstüne güncel Supabase alanlarını bindirmek için hafif canlı katman."""
     fields = (
-        "id,isbn,title,author,publisher,reading_status,o_da_okudu,category,favorite,"
-        "tags,notes,loaned_to,estimated_price,estimated_price_source,"
+        "id,isbn,title,author,publisher,reading_status,o_da_okudu,"
+        "reading_started_at,reading_finished_at,reread_wanted,reading_comment,"
+        "category,favorite,tags,notes,loaned_to,estimated_price,estimated_price_source,"
         "estimated_price_checked_at,created_at,updated_at"
     )
     page_size = 1000
@@ -2520,7 +2560,10 @@ def fetch_dashboard_stats() -> dict:
         try:
             response = (
                 supabase.table("books")
-                .select("id,isbn,title,reading_status,page_count,estimated_price")
+                .select(
+                    "id,isbn,title,author,publisher,reading_status,page_count,"
+                    "estimated_price,reading_finished_at"
+                )
                 .execute()
             )
             rows = response.data or []
@@ -2528,7 +2571,12 @@ def fetch_dashboard_stats() -> dict:
             rows = []
 
     total = len(rows)
-    read_count = sum(1 for row in rows if clean_text(row.get("reading_status")) == "Okundu")
+    read_rows = [row for row in rows if clean_text(row.get("reading_status")) == "Okundu"]
+    read_count = len(read_rows)
+    current_year = datetime.now().year
+    this_year_read_count = 0
+    author_counts = {}
+    publisher_counts = {}
     unread_pages = 0
     known_value = 0.0
     known_value_count = 0
@@ -2546,13 +2594,31 @@ def fetch_dashboard_stats() -> dict:
         elif clean_text(row.get("isbn")):
             missing_price.append(row)
 
+    for row in read_rows:
+        finished_year = first_year(row.get("reading_finished_at"))
+        if finished_year and safe_int(finished_year, 0) == current_year:
+            this_year_read_count += 1
+        for author in [part.strip() for part in clean_text(row.get("author")).split(",") if part.strip()]:
+            author_counts[author] = author_counts.get(author, 0) + 1
+        publisher = normalize_publisher_name(row.get("publisher"))
+        if publisher:
+            publisher_counts[publisher] = publisher_counts.get(publisher, 0) + 1
+
+    top_author, top_author_count = max(author_counts.items(), key=lambda item: item[1], default=("", 0))
+    top_publisher, top_publisher_count = max(publisher_counts.items(), key=lambda item: item[1], default=("", 0))
+
     return {
         "total": total,
         "read_count": read_count,
+        "this_year_read_count": this_year_read_count,
         "read_percent": round((read_count / total) * 100, 1) if total else 0,
         "unread_pages": unread_pages,
         "known_value": round(known_value, 2),
         "known_value_count": known_value_count,
+        "top_author": top_author,
+        "top_author_count": top_author_count,
+        "top_publisher": top_publisher,
+        "top_publisher_count": top_publisher_count,
         "missing_price": missing_price,
     }
 
@@ -2946,6 +3012,10 @@ def books_to_csv(books: list[dict]) -> str:
         "first_print_year",
         "reading_status",
         "o_da_okudu",
+        "reading_started_at",
+        "reading_finished_at",
+        "reread_wanted",
+        "reading_comment",
         "category",
         "favorite",
         "tags",
@@ -3474,7 +3544,35 @@ def build_form_data(prefix: str, initial: dict) -> dict:
         genre = st.text_input("Tür / Konu", value=clean_text(initial.get("genre")), key=f"{prefix}_genre")
         cover_url = st.text_input("Kapak Görseli URL", value=clean_text(initial.get("cover_url")), key=f"{prefix}_cover")
 
+    c5, c6 = st.columns(2)
+    with c5:
+        reading_started_at = st.text_input(
+            "Okumaya Başlama Tarihi",
+            value=normalize_date_text(initial.get("reading_started_at")),
+            placeholder="YYYY-MM-DD",
+            key=f"{prefix}_reading_started_at",
+        )
+        reread_wanted = st.checkbox(
+            "Tekrar okumak ister miyim?",
+            value=bool(initial.get("reread_wanted")),
+            key=f"{prefix}_reread_wanted",
+        )
+    with c6:
+        reading_finished_at = st.text_input(
+            "Bitirme Tarihi",
+            value=normalize_date_text(initial.get("reading_finished_at")),
+            placeholder="YYYY-MM-DD",
+            key=f"{prefix}_reading_finished_at",
+        )
+        read_days = days_between_dates(reading_started_at, reading_finished_at)
+        st.caption(f"Okuma süresi: {read_days} gün" if read_days else "Okuma süresi için başlangıç ve bitiş tarihi gir.")
+
     notes = st.text_area("Notlar", value=clean_text(initial.get("notes")), key=f"{prefix}_notes")
+    reading_comment = st.text_area(
+        "Kısa Okuma Yorumu",
+        value=clean_text(initial.get("reading_comment")),
+        key=f"{prefix}_reading_comment",
+    )
 
     return {
         "isbn": clean_text(initial.get("isbn")),
@@ -3496,6 +3594,10 @@ def build_form_data(prefix: str, initial: dict) -> dict:
         "category": category,
         "reading_status": reading_status,
         "o_da_okudu": o_da_okudu,
+        "reading_started_at": reading_started_at,
+        "reading_finished_at": reading_finished_at,
+        "reread_wanted": reread_wanted,
+        "reading_comment": reading_comment,
         "favorite": favorite,
         "tags": parse_tags(tags),
         "notes": notes,
@@ -3542,7 +3644,20 @@ def kitapsec_update_payload(current: dict, fetched: dict) -> dict:
         value = fetched.get(field)
         if is_usable_kitapsec_update_value(field, value):
             payload[field] = clean_text(value)
-    for field in ("category", "reading_status", "o_da_okudu", "favorite", "tags", "notes", "loaned_to", "rating"):
+    for field in (
+        "category",
+        "reading_status",
+        "o_da_okudu",
+        "reading_started_at",
+        "reading_finished_at",
+        "reread_wanted",
+        "reading_comment",
+        "favorite",
+        "tags",
+        "notes",
+        "loaned_to",
+        "rating",
+    ):
         payload[field] = current.get(field)
     return payload
 
@@ -3696,7 +3811,52 @@ def render_book_details(book: dict):
         st.write(f"**Ödünç:** {book.get('loaned_to') or '-'}")
         if clean_text(book.get("notes")):
             st.write(f"**Not:** {book.get('notes')}")
+    st.write(
+        f"**Okuma Geçmişi:** "
+        f"{normalize_date_text(book.get('reading_started_at')) or '-'} → "
+        f"{normalize_date_text(book.get('reading_finished_at')) or '-'}"
+    )
+    read_days = days_between_dates(book.get("reading_started_at"), book.get("reading_finished_at"))
+    st.write(f"**Kaç günde okundu:** {read_days if read_days else '-'}")
+    st.write(f"**Tekrar okumak ister miyim?:** {'Evet' if book.get('reread_wanted') else 'Hayır'}")
+    if clean_text(book.get("reading_comment")):
+        st.write(f"**Kısa yorum:** {book.get('reading_comment')}")
+    render_quick_reading_controls(book)
     render_kitapsec_update_controls(book)
+
+
+def render_quick_reading_controls(book: dict):
+    st.divider()
+    st.subheader("Hızlı Durum Değiştir")
+    book_id = book.get("id")
+    if not book_id:
+        st.caption("Bu kitabın veritabanı ID bilgisi olmadığı için hızlı güncelleme yapılamıyor.")
+        return
+
+    cols = st.columns(5)
+    today = datetime.now().date().isoformat()
+    for index, status in enumerate(["Okunacak", "Okunuyor", "Okundu", "Yarım Bırakıldı"]):
+        with cols[index]:
+            if st.button(status, use_container_width=True, key=f"quick_status_{book_id}_{status}"):
+                data = dict(book)
+                data["reading_status"] = status
+                if status == "Okunuyor" and not normalize_date_text(data.get("reading_started_at")):
+                    data["reading_started_at"] = today
+                if status == "Okundu" and not normalize_date_text(data.get("reading_finished_at")):
+                    data["reading_finished_at"] = today
+                if update_book(book_id, data):
+                    st.success(f"Durum güncellendi: {status}")
+                    st.rerun()
+
+    with cols[4]:
+        new_value = not bool(book.get("o_da_okudu"))
+        label = "O ;) da Okudu" if new_value else "O ;) Okumadı"
+        if st.button(label, use_container_width=True, key=f"quick_o_da_okudu_{book_id}"):
+            data = dict(book)
+            data["o_da_okudu"] = new_value
+            if update_book(book_id, data):
+                st.success("O ;) da Okudu bilgisi güncellendi.")
+                st.rerun()
 
 
 def render_book_editor(book: dict):
@@ -3872,8 +4032,14 @@ def render_home_page():
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Toplam Kitap", total)
     col2.metric("Okunan Kitap", read_count)
-    col3.metric("Okuma Oranı", f"%{stats['read_percent']}")
+    col3.metric("Bu Yıl Okunan", stats["this_year_read_count"])
     col4.metric("Kalan Sayfa", unread_pages)
+
+    col5, col6, col7, col8 = st.columns(4)
+    col5.metric("Okuma Oranı", f"%{stats['read_percent']}")
+    col6.metric("En Çok Okunan Yazar", stats["top_author"] or "-", f"{stats['top_author_count']} kitap" if stats["top_author_count"] else None)
+    col7.metric("En Çok Okunan Yayınevi", stats["top_publisher"] or "-", f"{stats['top_publisher_count']} kitap" if stats["top_publisher_count"] else None)
+    col8.metric("Tahmini Değer", format_tl(stats["known_value"]))
 
     st.subheader("Kalan Kitaplar Ne Zaman Biter?")
     daily_pages = st.number_input("Günde kaç sayfa okuyacaksın?", min_value=1, max_value=2000, value=100, step=10)
@@ -4676,6 +4842,68 @@ def render_bulk_add_page():
         st.error(f"{errors} satır kaydedilemedi.")
 
 
+def missing_info_rows(books: list[dict], field: str) -> list[dict]:
+    rows = []
+    for book in books:
+        missing = False
+        if field == "estimated_price":
+            missing = not book.get("estimated_price")
+        elif field == "reading_history":
+            missing = clean_text(book.get("reading_status")) == "Okundu" and not normalize_date_text(book.get("reading_finished_at"))
+        else:
+            missing = not clean_text(book.get(field))
+        if missing:
+            rows.append(
+                {
+                    "ISBN": clean_text(book.get("isbn")),
+                    "Kitap Adı": book_title(book),
+                    "Yazar": book_author(book),
+                    "Yayınevi": clean_text(book.get("publisher")),
+                    "Durum": clean_text(book.get("reading_status")) or "Okunacak",
+                }
+            )
+    return rows
+
+
+def render_missing_info_page():
+    st.header("Eksik Bilgiler")
+    books = fetch_books()
+    if not books:
+        st.info("Kütüphanede kitap görünmüyor.")
+        return
+
+    checks = [
+        ("Kapak", "cover_url"),
+        ("Yazar", "author"),
+        ("Yayınevi", "publisher"),
+        ("Sayfa Sayısı", "page_count"),
+        ("Yayın / Baskı Yılı", "first_print_year"),
+        ("Tahmini Fiyat", "estimated_price"),
+        ("Okundu Ama Bitiş Tarihi Yok", "reading_history"),
+    ]
+
+    summary_rows = []
+    missing_by_label = {}
+    for label, field in checks:
+        rows = missing_info_rows(books, field)
+        missing_by_label[label] = rows
+        summary_rows.append({"Eksik Bilgi": label, "Kitap Sayısı": len(rows)})
+
+    st.dataframe(summary_rows, use_container_width=True, hide_index=True)
+
+    selected_label = st.selectbox("Detayını göster", [label for label, _ in checks], key="missing_info_detail")
+    rows = missing_by_label.get(selected_label, [])
+    if not rows:
+        st.success(f"{selected_label} için eksik kayıt görünmüyor.")
+        return
+
+    st.caption(f"{selected_label} eksik olan kitap sayısı: {len(rows)}")
+    st.dataframe(rows, use_container_width=True, hide_index=True, height=520)
+
+    if selected_label in {"Kapak", "Yazar", "Yayınevi", "Sayfa Sayısı", "Yayın / Baskı Yılı", "Tahmini Fiyat"}:
+        st.info("Bu listedeki kitapları Detaylı Kütüphanem sayfasından veya toplu Kitapseç güncellemesiyle tamamlayabilirsin.")
+
+
 def render_library_page(all_books: list[dict], filters: tuple):
     personal_filter, status_filter, tag_filter, search_term, sort_by = filters
     st.header("Detaylı Kütüphanem")
@@ -5203,6 +5431,8 @@ elif st.session_state.get("page") == "bulk_add":
     render_bulk_add_page()
 elif st.session_state.get("page") == "lookup_queue":
     render_lookup_queue_page()
+elif st.session_state.get("page") == "missing_info":
+    render_missing_info_page()
 elif st.session_state.get("page") == "wishlist":
     render_wishlist_page()
 elif st.session_state.get("page") == "recommendations":
