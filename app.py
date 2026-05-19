@@ -3964,6 +3964,25 @@ def render_static_library_package_controls():
             )
 
 
+def mark_book_row_as_read(row: dict) -> tuple[str, str]:
+    isbn = clean_text(row.get("ISBN"))
+    current = fetch_book_by_id(row.get("id")) or fetch_book_by_isbn(isbn)
+    label = isbn or clean_text(row.get("Kitap Adı")) or "Kitap"
+    if not current:
+        return "error", f"{label}: veritabanı kaydı yüklenemedi"
+
+    data = dict(current)
+    data["reading_status"] = "Okundu"
+    if not normalize_date_text(data.get("reading_finished_at")):
+        data["reading_finished_at"] = datetime.now().date().isoformat()
+    if clean_text(data.get("page_count")):
+        data["current_page"] = only_digits(data.get("page_count")) or clean_text(data.get("page_count"))
+
+    if update_book(current.get("id"), data):
+        return "updated", f"{label}: Okundu yapıldı"
+    return "error", f"{label}: güncelleme kaydedilemedi"
+
+
 def render_quick_search_page(book_index: list[dict]):
     st.header("Hızlı Arama")
     render_static_library_package_controls()
@@ -4008,13 +4027,34 @@ def render_quick_search_page(book_index: list[dict]):
     if supabase_fallback_note:
         st.info(supabase_fallback_note)
 
+    st.session_state.setdefault("quick_library_editor_nonce", 0)
+    current_keys = [book_identity_key(book) for book in preview]
+    selected_keys = [
+        key
+        for key in st.session_state.get("quick_library_selected_keys", [])
+        if key in set(current_keys)
+    ]
+    select_col, clear_col = st.columns([0.24, 0.76])
+    with select_col:
+        if st.button("Gösterilenleri Seç", use_container_width=True, key="quick_library_select_all"):
+            st.session_state["quick_library_selected_keys"] = current_keys
+            st.session_state["quick_library_editor_nonce"] += 1
+            st.rerun()
+    with clear_col:
+        if st.button("Seçimi Temizle", use_container_width=True, key="quick_library_clear_selection"):
+            st.session_state["quick_library_selected_keys"] = []
+            st.session_state["quick_library_editor_nonce"] += 1
+            st.rerun()
+
+    selected_key_set = set(selected_keys)
     rows = [
         {
-            "Kitapseç'ten Güncelle": False,
+            "Seç": book_identity_key(book) in selected_key_set,
             "ISBN": clean_text(book.get("isbn")),
             "Kitap Adı": clean_text(book.get("title")),
             "Yazar": clean_text(book.get("author")),
             "id": book.get("id"),
+            "_key": book_identity_key(book),
         }
         for book in preview
     ]
@@ -4023,26 +4063,41 @@ def render_quick_search_page(book_index: list[dict]):
         use_container_width=True,
         hide_index=True,
         num_rows="fixed",
-        key="quick_library_editor",
+        key=f"quick_library_editor_{st.session_state['quick_library_editor_nonce']}",
         column_config={
-            "Kitapseç'ten Güncelle": st.column_config.CheckboxColumn("Kitapseç'ten Güncelle"),
+            "Seç": st.column_config.CheckboxColumn("Seç"),
             "ISBN": st.column_config.TextColumn("ISBN", disabled=True),
             "Kitap Adı": st.column_config.TextColumn("Kitap Adı", disabled=True),
             "Yazar": st.column_config.TextColumn("Yazar", disabled=True),
             "id": None,
+            "_key": None,
         },
     )
     edited_rows = editor_rows_to_list(edited)
-    selected_rows = [row for row in edited_rows if row.get("Kitapseç'ten Güncelle")]
-    st.caption(f"Gösterilen kayıt: {len(preview)} · Güncellenecek: {len(selected_rows)}")
+    selected_rows = [row for row in edited_rows if row.get("Seç")]
+    st.session_state["quick_library_selected_keys"] = [
+        clean_text(row.get("_key")) for row in selected_rows if clean_text(row.get("_key"))
+    ]
+    st.caption(f"Gösterilen kayıt: {len(preview)} · Seçili: {len(selected_rows)}")
 
-    if st.button(
-        f"Seçili {len(selected_rows)} Kitabı Kitapseç'ten Güncelle",
-        type="primary",
-        use_container_width=True,
-        disabled=not selected_rows,
-        key="quick_library_kitapsec_update",
-    ):
+    kitapsec_col, read_col = st.columns(2)
+    with kitapsec_col:
+        run_kitapsec_update = st.button(
+            f"Seçili {len(selected_rows)} Kitabı Kitapseç'ten Güncelle",
+            type="primary",
+            use_container_width=True,
+            disabled=not selected_rows,
+            key="quick_library_kitapsec_update",
+        )
+    with read_col:
+        mark_selected_read = st.button(
+            f"Seçili {len(selected_rows)} Kitabı Okundu Yap",
+            use_container_width=True,
+            disabled=not selected_rows,
+            key="quick_library_mark_read",
+        )
+
+    if run_kitapsec_update:
         progress = st.progress(0)
         status_box = st.empty()
         result = {"updated": 0, "not_found": 0, "skipped": 0, "error": 0}
@@ -4052,7 +4107,7 @@ def render_quick_search_page(book_index: list[dict]):
             progress.progress(index / len(selected_rows))
             isbn = clean_text(row.get("ISBN"))
             status_box.info(f"{index}/{len(selected_rows)} Kitapseç'ten güncelleniyor: {isbn}")
-            current = fetch_book_by_id(row.get("id"))
+            current = fetch_book_by_id(row.get("id")) or fetch_book_by_isbn(isbn)
             if not current:
                 status = "error"
                 message = f"{isbn or row.get('Kitap Adı')}: veritabanı kaydı yüklenemedi"
@@ -4069,6 +4124,32 @@ def render_quick_search_page(book_index: list[dict]):
             f"Atlanan: {result['skipped']} · "
             f"Hata: {result['error']}"
         )
+        with st.expander("İşlem özeti", expanded=False):
+            for item in examples:
+                st.write(f"- {item}")
+
+    if mark_selected_read:
+        progress = st.progress(0)
+        status_box = st.empty()
+        result = {"updated": 0, "error": 0}
+        examples = []
+
+        for index, row in enumerate(selected_rows, start=1):
+            progress.progress(index / len(selected_rows))
+            isbn = clean_text(row.get("ISBN"))
+            status_box.info(f"{index}/{len(selected_rows)} Okundu yapılıyor: {isbn or row.get('Kitap Adı')}")
+            status, message = mark_book_row_as_read(row)
+            result[status] = result.get(status, 0) + 1
+            if len(examples) < 20:
+                examples.append(message)
+
+        status_box.success(
+            f"Okundu güncellemesi tamamlandı. "
+            f"Güncellenen: {result['updated']} · "
+            f"Hata: {result['error']}"
+        )
+        st.session_state["quick_library_selected_keys"] = []
+        st.session_state["quick_library_editor_nonce"] += 1
         with st.expander("İşlem özeti", expanded=False):
             for item in examples:
                 st.write(f"- {item}")
